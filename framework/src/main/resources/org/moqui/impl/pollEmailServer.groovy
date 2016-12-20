@@ -38,10 +38,10 @@ Logger logger = LoggerFactory.getLogger("org.moqui.impl.pollEmailServer")
 ExecutionContextImpl ec = context.ec
 
 EntityValue emailServer = ec.entity.find("moqui.basic.email.EmailServer").condition("emailServerId", emailServerId).one()
-if (!emailServer) { ec.message.addError("No EmailServer found for ID [${emailServerId}]"); return }
-if (!emailServer.storeHost) { ec.message.addError("EmailServer [${emailServerId}] has no storeHost") }
-if (!emailServer.mailUsername) { ec.message.addError("EmailServer [${emailServerId}] has no mailUsername") }
-if (!emailServer.mailPassword) { ec.message.addError("EmailServer [${emailServerId}] has no mailPassword") }
+if (!emailServer) { ec.message.addError(ec.resource.expand('No EmailServer found for ID [${emailServerId}]','')); return }
+if (!emailServer.storeHost) { ec.message.addError(ec.resource.expand('EmailServer [${emailServerId}] has no storeHost','')) }
+if (!emailServer.mailUsername) { ec.message.addError(ec.resource.expand('EmailServer [${emailServerId}] has no mailUsername','')) }
+if (!emailServer.mailPassword) { ec.message.addError(ec.resource.expand('EmailServer [${emailServerId}] has no mailPassword','')) }
 if (ec.message.hasError()) return
 
 String host = emailServer.storeHost
@@ -51,16 +51,16 @@ String protocol = emailServer.storeProtocol ?: "imaps"
 int port = (emailServer.storePort ?: "993") as int
 String storeFolder = emailServer.storeFolder ?: "INBOX"
 
-logger.info("Polling Email from ${user}@${host}:${port}/${storeFolder}")
-
 // def urlName = new URLName(protocol, host, port as int, "", user, password)
 Session session = Session.getInstance(System.getProperties())
+logger.info("Polling Email from ${user}@${host}:${port}/${storeFolder}, properties ${session.getProperties()}")
+
 Store store = session.getStore(protocol)
 if (!store.isConnected()) store.connect(host, port, user, password)
 
 // open the folder
 Folder folder = store.getFolder(storeFolder)
-if (folder == null || !folder.exists()) { ec.message.addError("No ${storeFolder} folder found"); return }
+if (folder == null || !folder.exists()) { ec.message.addError(ec.resource.expand('No ${storeFolder} folder found','')); return }
 
 // get message count
 folder.open(Folder.READ_WRITE)
@@ -86,7 +86,9 @@ for (Message message in messages) {
 
     // NOTE: should we check size? long messageSize = message.getSize()
     if (message instanceof MimeMessage) {
-        ec.service.runEmecaRules(message, emailServerId)
+        // use copy constructor to have it download the full message, may fix BODYSTRUCTURE issue from some email servers (see details in issue #97)
+        MimeMessage fullMessage = new MimeMessage(message)
+        ec.service.runEmecaRules(fullMessage, emailServerId)
 
         // mark seen if setup to do so
         if (emailServer.storeMarkSeen == "Y") message.setFlag(Flags.Flag.SEEN, true)

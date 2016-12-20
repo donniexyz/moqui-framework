@@ -15,8 +15,6 @@ package org.moqui.impl.screen
 
 import freemarker.template.Template
 import groovy.transform.CompileStatic
-import org.apache.commons.codec.net.URLCodec
-import org.apache.commons.collections.map.ListOrderedMap
 
 import org.moqui.BaseException
 import org.moqui.context.*
@@ -25,23 +23,27 @@ import org.moqui.entity.EntityException
 import org.moqui.entity.EntityList
 import org.moqui.entity.EntityListIterator
 import org.moqui.entity.EntityValue
-import org.moqui.impl.StupidUtilities
-import org.moqui.impl.StupidWebUtilities
+import org.moqui.impl.entity.EntityFacadeImpl
+import org.moqui.util.WebUtilities
 import org.moqui.impl.context.ArtifactExecutionInfoImpl
+import org.moqui.impl.context.ContextJavaUtil
+import org.moqui.impl.context.ExecutionContextFactoryImpl
 import org.moqui.impl.context.ExecutionContextImpl
 import org.moqui.impl.context.ResourceFacadeImpl
-import org.moqui.impl.context.UserFacadeImpl
 import org.moqui.impl.context.WebFacadeImpl
 import org.moqui.impl.entity.EntityDefinition
 import org.moqui.impl.entity.EntityValueBase
 import org.moqui.impl.entity.EntityValueImpl
 import org.moqui.impl.screen.ScreenDefinition.ResponseItem
 import org.moqui.impl.screen.ScreenDefinition.SubscreensItem
+import org.moqui.impl.screen.ScreenForm.FormInstance
 import org.moqui.impl.screen.ScreenUrlInfo.UrlInstance
-import org.moqui.impl.util.FtlNodeWrapper
 import org.moqui.screen.ScreenRender
+import org.moqui.util.ContextStack
 import org.moqui.util.MNode
-
+import org.moqui.resource.ResourceReference
+import org.moqui.util.ObjectUtilities
+import org.moqui.util.StringUtilities
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 
@@ -51,49 +53,51 @@ import javax.servlet.http.HttpServletResponse
 @CompileStatic
 class ScreenRenderImpl implements ScreenRender {
     protected final static Logger logger = LoggerFactory.getLogger(ScreenRenderImpl.class)
-    protected final static URLCodec urlCodec = new URLCodec()
+    protected final static boolean isTraceEnabled = logger.isTraceEnabled()
 
-    protected final ScreenFacadeImpl sfi
-    protected ExecutionContextImpl localEc = null
+    public final ScreenFacadeImpl sfi
+    public final ExecutionContextImpl ec
     protected boolean rendering = false
 
-    protected String rootScreenLocation = null
-    protected ScreenDefinition rootScreenDef = null
-    protected ScreenDefinition overrideActiveScreenDef = null
+    protected String rootScreenLocation = (String) null
+    protected ScreenDefinition rootScreenDef = (ScreenDefinition) null
+    protected ScreenDefinition overrideActiveScreenDef = (ScreenDefinition) null
 
-    protected List<String> originalScreenPathNameList = new ArrayList<String>()
-    protected ScreenUrlInfo screenUrlInfo = null
-    protected UrlInstance screenUrlInstance = null
+    protected ArrayList<String> originalScreenPathNameList = new ArrayList<String>()
+    protected ScreenUrlInfo screenUrlInfo = (ScreenUrlInfo) null
+    protected UrlInstance screenUrlInstance = (UrlInstance) null
     protected Map<String, ScreenUrlInfo> subscreenUrlInfos = new HashMap()
     protected int screenPathIndex = 0
     protected Set<String> stopRenderScreenLocations = new HashSet()
 
-    protected String baseLinkUrl = null
-    protected String servletContextPath = null
-    protected String webappName = null
+    protected String baseLinkUrl = (String) null
+    protected String servletContextPath = (String) null
+    protected String webappName = (String) null
 
-    protected String renderMode = null
+    protected String renderMode = (String) null
     protected String characterEncoding = "UTF-8"
     /** For HttpServletRequest/Response renders this will be set on the response either as this default or a value
      * determined during render, especially for screen sub-content based on the extension of the filename. */
-    protected String outputContentType = null
+    protected String outputContentType = (String) null
 
-    protected String macroTemplateLocation = null
-    protected Boolean boundaryComments = null
+    protected String macroTemplateLocation = (String) null
+    protected Boolean boundaryComments = (Boolean) null
 
-    protected HttpServletRequest request = null
-    protected HttpServletResponse response = null
-    protected Writer internalWriter = null
-    protected Writer afterScreenWriter = null
-    protected Writer scriptWriter= null
+    protected HttpServletRequest request = (HttpServletRequest) null
+    protected HttpServletResponse response = (HttpServletResponse) null
+    protected Writer internalWriter = (Writer) null
+    protected Writer afterScreenWriter = (Writer) null
+    protected Writer scriptWriter = (Writer) null
 
     protected boolean dontDoRender = false
 
-    protected Map<String, MNode> screenFormNodeCache = new HashMap()
+    protected Map<String, FormInstance> screenFormCache = new HashMap<>()
+    protected String curThemeId = (String) null
+    protected Map<String, ArrayList<String>> curThemeValuesByType = new HashMap<>()
 
     ScreenRenderImpl(ScreenFacadeImpl sfi) {
         this.sfi = sfi
-        this.localEc = sfi.ecfi.getEci()
+        ec = sfi.ecfi.getEci()
     }
 
     Writer getWriter() {
@@ -105,29 +109,21 @@ class ScreenRenderImpl implements ScreenRender {
         throw new BaseException("Could not render screen, no writer available")
     }
 
-    ExecutionContextImpl getEc() { return localEc }
-    ScreenFacadeImpl getSfi() { return sfi }
     ScreenUrlInfo getScreenUrlInfo() { return screenUrlInfo }
     UrlInstance getScreenUrlInstance() { return screenUrlInstance }
 
     @Override
-    ScreenRender rootScreen(String rootScreenLocation) { this.rootScreenLocation = rootScreenLocation; return this }
+    ScreenRender rootScreen(String rsLocation) { rootScreenLocation = rsLocation; return this }
 
-    ScreenRender rootScreenFromHost(String host) {
-        for (MNode rootScreenNode in getWebappNode().children("root-screen")) {
-            if (host.matches((String) rootScreenNode.attribute('host')))
-                return this.rootScreen((String) rootScreenNode.attribute('location'))
-        }
-        throw new BaseException("Could not find root screen for host [${host}]")
-    }
+    ScreenRender rootScreenFromHost(String host) { return rootScreen(sfi.rootScreenFromHost(host, webappName)) }
 
     @Override
-    ScreenRender screenPath(List<String> screenNameList) { this.originalScreenPathNameList.addAll(screenNameList); return this }
+    ScreenRender screenPath(List<String> screenNameList) { originalScreenPathNameList.addAll(screenNameList); return this }
 
     @Override
     ScreenRender renderMode(String renderMode) { this.renderMode = renderMode; return this }
 
-    String getRenderMode() { return this.renderMode }
+    String getRenderMode() { return renderMode }
 
     @Override
     ScreenRender encoding(String characterEncoding) { this.characterEncoding = characterEncoding;  return this }
@@ -151,9 +147,14 @@ class ScreenRenderImpl implements ScreenRender {
         this.request = request
         this.response = response
         // NOTE: don't get the writer at this point, we don't yet know if we're writing text or binary
-        if (!webappName) webappName(request.session.servletContext.getInitParameter("moqui-name"))
-        if (webappName && !rootScreenLocation) rootScreenFromHost(request.getServerName())
-        if (!originalScreenPathNameList) screenPath(request.getPathInfo().split("/") as List)
+        if (webappName == null || webappName.length() == 0)
+            webappName(request.servletContext.getInitParameter("moqui-name"))
+        if (webappName != null && webappName.length() > 0 && (rootScreenLocation == null || rootScreenLocation.length() == 0))
+            rootScreenFromHost(request.getServerName())
+        if (originalScreenPathNameList == null || originalScreenPathNameList.size() == 0) {
+            String pathInfo = request.getPathInfo()
+            if (pathInfo != null) screenPath(Arrays.asList(pathInfo.split("/")))
+        }
         // now render
         internalRender()
     }
@@ -180,69 +181,113 @@ class ScreenRenderImpl implements ScreenRender {
         if (response != null) {
             response.sendRedirect(redirectUrl)
             dontDoRender = true
-            logger.info("Redirecting to ${redirectUrl} instead of rendering ${this.getScreenUrlInfo().getFullPathNameList()}")
+            if (logger.isInfoEnabled()) logger.info("Redirecting to ${redirectUrl} instead of rendering ${this.getScreenUrlInfo().getFullPathNameList()}")
+        }
+    }
+    boolean sendJsonRedirect(UrlInstance fullUrl) {
+        if ("json".equals(screenUrlInfo.targetTransitionExtension) || "application/json".equals(request?.getHeader("Accept"))) {
+            Map<String, Object> responseMap = new HashMap<>()
+            // add saveMessagesToSession, saveRequestParametersToSession/saveErrorParametersToSession data
+            // add all plain object data from session?
+            if (ec.message.getMessages().size() > 0) responseMap.put("messages", ec.message.messages)
+            if (ec.message.getErrors().size() > 0) responseMap.put("errors", ec.message.errors)
+            if (ec.message.getValidationErrors().size() > 0) {
+                List<ValidationError> valErrorList = ec.message.getValidationErrors()
+                int valErrorListSize = valErrorList.size()
+                ArrayList<Map> valErrMapList = new ArrayList<>(valErrorListSize)
+                for (int i = 0; i < valErrorListSize; i++) valErrMapList.add(valErrorList.get(i).getMap())
+                responseMap.put("validationErrors", valErrMapList)
+            }
+
+            Map parms = new HashMap()
+            if (ec.web.requestParameters != null) parms.putAll(ec.web.requestParameters)
+            if (ec.web.requestAttributes != null) parms.putAll(ec.web.requestAttributes)
+            responseMap.put("currentParameters", ContextJavaUtil.unwrapMap(parms))
+
+            // add screen path, parameters from fullUrl
+            responseMap.put("screenPathList", fullUrl.sui.fullPathNameList)
+            responseMap.put("screenParameters", fullUrl.getParameterMap())
+            responseMap.put("screenUrl", fullUrl.getPathWithParams())
+
+            ec.web.sendJsonResponse(responseMap)
+            return true
+        } else {
+            return false
         }
     }
 
-    protected ResponseItem recursiveRunTransition(Iterator<ScreenDefinition> sdIterator) {
+    protected ResponseItem recursiveRunTransition(Iterator<ScreenDefinition> sdIterator, boolean runPreActions) {
         ScreenDefinition sd = sdIterator.next()
         // for these authz is not required, as long as something authorizes on the way to the transition, or
         // the transition itself, it's fine
-        ArtifactExecutionInfoImpl aei = new ArtifactExecutionInfoImpl(sd.location, "AT_XML_SCREEN", "AUTHZA_VIEW")
-        ec.getArtifactExecutionImpl().pushInternal(aei, false)
+        ArtifactExecutionInfoImpl aei = new ArtifactExecutionInfoImpl(sd.location,
+                ArtifactExecutionInfo.AT_XML_SCREEN, ArtifactExecutionInfo.AUTHZA_VIEW, null)
+        ec.artifactExecutionFacade.pushInternal(aei, false)
 
         boolean loggedInAnonymous = false
-        MNode screenNode = sd.getScreenNode()
-        String requireAuthentication = screenNode.attribute('require-authentication')
-        if (requireAuthentication == "anonymous-all") {
-            ec.artifactExecution.setAnonymousAuthorizedAll()
-            loggedInAnonymous = ec.getUser().loginAnonymousIfNoUser()
-        } else if (requireAuthentication == "anonymous-view") {
-            ec.artifactExecution.setAnonymousAuthorizedView()
-            loggedInAnonymous = ec.getUser().loginAnonymousIfNoUser()
-        }
+        ResponseItem ri = (ResponseItem) null
 
-        if (sd.alwaysActions != null) sd.alwaysActions.run(ec)
-
-        ResponseItem ri = null
-        if (sdIterator.hasNext()) {
-            screenPathIndex++
-            try {
-                ri = recursiveRunTransition(sdIterator)
-            } finally {
-                screenPathIndex--
+        try {
+            MNode screenNode = sd.getScreenNode()
+            String requireAuthentication = screenNode.attribute("require-authentication")
+            if (requireAuthentication == "anonymous-all") {
+                ec.artifactExecutionFacade.setAnonymousAuthorizedAll()
+                loggedInAnonymous = ec.userFacade.loginAnonymousIfNoUser()
+            } else if (requireAuthentication == "anonymous-view") {
+                ec.artifactExecutionFacade.setAnonymousAuthorizedView()
+                loggedInAnonymous = ec.userFacade.loginAnonymousIfNoUser()
             }
-        } else {
-            // run the transition
-            ri = screenUrlInstance.targetTransition.run(this)
-        }
 
-        ec.getArtifactExecution().pop(aei)
-        if (loggedInAnonymous) ((UserFacadeImpl) ec.getUser()).logoutAnonymousOnly()
+            if (sd.alwaysActions != null) sd.alwaysActions.run(ec)
+            if (runPreActions && sd.preActions != null) sd.preActions.run(ec)
+
+            if (sdIterator.hasNext()) {
+                screenPathIndex++
+                try {
+                    ri = recursiveRunTransition(sdIterator, runPreActions)
+                } finally {
+                    screenPathIndex--
+                }
+            } else {
+                // run the transition
+                ri = screenUrlInstance.targetTransition.run(this)
+            }
+        } finally {
+            ec.artifactExecutionFacade.pop(aei)
+            if (loggedInAnonymous) ec.userFacade.logoutAnonymousOnly()
+        }
 
         return ri
     }
 
     protected void internalRender() {
-        rootScreenDef = sfi.getScreenDefinition(rootScreenLocation)
-        if (rootScreenDef == null) throw new BaseException("Could not find root screen at location [${rootScreenLocation}]")
+        long renderStartTime = System.currentTimeMillis()
 
-        if (logger.traceEnabled) logger.trace("Rendering screen [${rootScreenLocation}] with path list [${originalScreenPathNameList}]")
+        rootScreenDef = sfi.getScreenDefinition(rootScreenLocation)
+        if (rootScreenDef == null) throw new BaseException("Could not find root screen at location ${rootScreenLocation}")
+
+        if (logger.traceEnabled) logger.trace("Rendering screen ${rootScreenLocation} with path list ${originalScreenPathNameList}")
         // logger.info("Rendering screen [${rootScreenLocation}] with path list [${originalScreenPathNameList}]")
 
+        WebFacade web = ec.getWeb()
+        String lastStandalone = web != null ? web.requestParameters.lastStandalone : null
         screenUrlInfo = ScreenUrlInfo.getScreenUrlInfo(this, rootScreenDef, originalScreenPathNameList, null,
-                (ec.getWeb() != null && ec.getWeb().requestParameters.lastStandalone == "true"))
+                ScreenUrlInfo.parseLastStandalone(lastStandalone, 0))
+
+        // if the target of the url doesn't exist throw exception
+        screenUrlInfo.checkExists()
         screenUrlInstance = screenUrlInfo.getInstance(this, false)
-        if (ec.getWeb()) {
+
+        if (web != null) {
             // clear out the parameters used for special screen URL config
-            if (ec.getWeb().requestParameters.lastStandalone) ec.getWeb().requestParameters.lastStandalone = ""
+            if (lastStandalone != null && lastStandalone.length() > 0) web.requestParameters.lastStandalone = ""
 
             // if screenUrlInfo has any parameters add them to the request (probably came from a transition acting as an alias)
             Map<String, String> suiParameterMap = screenUrlInstance.getTransitionAliasParameters()
-            if (suiParameterMap) ec.getWeb().requestParameters.putAll(suiParameterMap)
+            if (suiParameterMap != null) web.requestParameters.putAll(suiParameterMap)
 
             // add URL parameters, if there were any in the URL (in path info or after ?)
-            screenUrlInstance.addParameters(ec.getWeb().requestParameters)
+            screenUrlInstance.addParameters(web.requestParameters)
         }
 
         // check webapp settings for each screen in the path
@@ -251,21 +296,26 @@ class ScreenRenderImpl implements ScreenRender {
         }
 
         // check this here after the ScreenUrlInfo (with transition alias, etc) has already been handled
-        if (ec.getWeb() != null && ec.getWeb().requestParameters.renderMode) {
-            // we know this is a web request, set defaults if missing
-            renderMode = ec.getWeb().requestParameters.renderMode
+        String localRenderMode = web != null ? web.requestParameters.renderMode : null
+        if ((renderMode == null || renderMode.length() == 0) && localRenderMode != null && localRenderMode.length() > 0)
+            renderMode = localRenderMode
+        // if no renderMode get from target screen extension in URL
+        if ((renderMode == null || renderMode.length() == 0) && screenUrlInfo.targetScreenRenderMode != null)
+            renderMode = screenUrlInfo.targetScreenRenderMode
+        // if no outputContentType but there is a renderMode get outputContentType based on renderMode
+        if ((outputContentType == null || outputContentType.length() == 0) && renderMode != null && renderMode.length() > 0) {
             String mimeType = sfi.getMimeTypeByMode(renderMode)
-            if (mimeType) outputContentType = mimeType
+            if (mimeType != null && mimeType.length() > 0) outputContentType = mimeType
         }
 
-        // if these aren't set in any screen (in the checkWebappSettings method), set them here
-        if (!renderMode) renderMode = "html"
-        if (!characterEncoding) characterEncoding = "UTF-8"
-        if (!outputContentType) outputContentType = "text/html"
+        // if these aren't set yet then set to basic defaults
+        if (renderMode == null || renderMode.length() == 0) renderMode = "html"
+        if (characterEncoding == null || characterEncoding.length() == 0) characterEncoding = "UTF-8"
+        if (outputContentType == null || outputContentType.length() == 0) outputContentType = "text/html"
 
 
         // before we render, set the character encoding (set the content type later, after we see if there is sub-content with a different type)
-        if (this.response != null) response.setCharacterEncoding(this.characterEncoding)
+        if (response != null) response.setCharacterEncoding(characterEncoding)
 
         // if there is a transition run that INSTEAD of the screen to render
         ScreenDefinition.TransitionItem targetTransition = screenUrlInstance.getTargetTransition()
@@ -274,10 +324,15 @@ class ScreenRenderImpl implements ScreenRender {
             // if this transition has actions and request was not secure or any parameters were not in the body
             // return an error, helps prevent CSRF/XSRF attacks
             if (request != null && targetTransition.hasActionsOrSingleService()) {
+                ExecutionContextFactoryImpl.WebappInfo webappInfo = ec.ecfi.getWebappInfo(webappName)
+                String queryString = request.getQueryString()
+
+                // NOTE: We decode path parameter ourselves, so use getRequestURI instead of getPathInfo
+                Map<String, Object> pathInfoParameterMap = WebUtilities.getPathInfoParameterMap(request.getRequestURI())
                 if (!targetTransition.isReadOnly() && (
-                        (!request.isSecure() && getWebappNode().attribute('https-enabled') != "false") ||
-                        request.getQueryString() ||
-                        StupidWebUtilities.getPathInfoParameterMap(request.getPathInfo()))) {
+                        (!request.isSecure() && webappInfo.httpsEnabled) ||
+                        (queryString != null && queryString.length() > 0) ||
+                        (pathInfoParameterMap != null && pathInfoParameterMap.size() > 0))) {
                     throw new IllegalArgumentException(
                         """Cannot run screen transition with actions from non-secure request or with URL
                         parameters for security reasons (they are not encrypted and need to be for data
@@ -285,87 +340,90 @@ class ScreenRenderImpl implements ScreenRender {
                         form with hidden input fields instead, or declare the transition as read-only.""")
                 }
                 // require a moquiSessionToken parameter for all but get
-                if (request.getMethod().toLowerCase() != "get" &&
-                        getWebappNode().attribute("require-session-token") != "false" &&
+                if (request.getMethod().toLowerCase() != "get" && webappInfo.requireSessionToken &&
                         targetTransition.getRequireSessionToken() &&
-                        request.getAttribute("moqui.session.token.created") != "true" &&
-                        request.getAttribute("moqui.request.authenticated") != "true") {
-                    String passedToken = ec.web.getParameters().get("moquiSessionToken")
+                        !"true".equals(request.getAttribute("moqui.session.token.created")) &&
+                        !"true".equals(request.getAttribute("moqui.request.authenticated"))) {
+                    String passedToken = (String) ec.web.getParameters().get("moquiSessionToken")
                     String curToken = ec.web.getSessionToken()
-                    if (curToken) {
-                        if (!passedToken) {
+                    if (curToken != null && curToken.length() > 0) {
+                        if (passedToken == null || passedToken.length() == 0) {
                             throw new IllegalArgumentException("Session token required (in moquiSessionToken) for URL ${screenUrlInstance.url}")
-                        } else if (curToken != passedToken) {
+                        } else if (!curToken.equals(passedToken)) {
                             throw new IllegalArgumentException("Session token does not match (in moquiSessionToken) for URL ${screenUrlInstance.url}")
                         }
                     }
                 }
             }
 
-            long transitionStartTime = System.currentTimeMillis()
             long startTimeNanos = System.nanoTime()
 
+            TransactionFacade transactionFacade = sfi.getEcfi().transactionFacade
             boolean beginTransaction = targetTransition.getBeginTransaction()
-            boolean beganTransaction = beginTransaction ? sfi.getEcfi().getTransactionFacade().begin(null) : false
+            boolean beganTransaction = beginTransaction ? transactionFacade.begin(null) : false
             ResponseItem ri = null
             try {
-                ri = recursiveRunTransition(screenUrlInfo.screenPathDefList.iterator())
+                boolean runPreActions = targetTransition instanceof ScreenDefinition.ActionsTransitionItem
+                ri = recursiveRunTransition(screenUrlInfo.screenPathDefList.iterator(), runPreActions)
             } catch (Throwable t) {
-                sfi.ecfi.transactionFacade.rollback(beganTransaction, "Error running transition in [${screenUrlInstance.url}]", t)
+                transactionFacade.rollback(beganTransaction, "Error running transition in [${screenUrlInstance.url}]", t)
                 throw t
             } finally {
                 try {
-                    if (sfi.ecfi.transactionFacade.isTransactionInPlace()) {
+                    if (transactionFacade.isTransactionInPlace()) {
                         if (ec.getMessage().hasError()) {
-                            sfi.ecfi.transactionFacade.rollback(beganTransaction, ec.getMessage().getErrorsString(), null)
+                            transactionFacade.rollback(beganTransaction, ec.getMessage().getErrorsString(), null)
                         } else {
-                            sfi.ecfi.transactionFacade.commit(beganTransaction)
+                            transactionFacade.commit(beganTransaction)
                         }
                     }
                 } catch (Exception e) {
                     logger.error("Error ending screen transition transaction", e)
                 }
 
-                if (screenUrlInfo.targetScreen.screenNode.attribute('track-artifact-hit') != "false") {
-                    sfi.ecfi.countArtifactHit("transition", ri?.type ?: "",
+                if (!"false".equals(screenUrlInfo.targetScreen.screenNode.attribute("track-artifact-hit"))) {
+                    String riType = ri != null ? ri.type : null
+                    sfi.ecfi.countArtifactHit(ArtifactExecutionInfo.AT_XML_SCREEN_TRANS, riType != null ? riType : "",
                             targetTransition.parentScreen.getLocation() + "#" + targetTransition.name,
-                            (ec.getWeb() ? ec.getWeb().requestParameters : null), transitionStartTime,
+                            (web != null ? web.requestParameters : null), renderStartTime,
                             (System.nanoTime() - startTimeNanos)/1E6, null)
                 }
             }
 
             if (ri == null) throw new IllegalArgumentException("No response found for transition [${screenUrlInstance.targetTransition.name}] on screen ${screenUrlInfo.targetScreen.location}")
 
-            if (ri.saveCurrentScreen && ec.getWeb() != null) {
+            WebFacadeImpl wfi = (WebFacadeImpl) null
+            if (web != null && web instanceof WebFacadeImpl) wfi = (WebFacadeImpl) web
+
+            if (ri.saveCurrentScreen && wfi != null) {
                 StringBuilder screenPath = new StringBuilder()
                 for (String pn in screenUrlInfo.fullPathNameList) screenPath.append("/").append(pn)
-                ((WebFacadeImpl) ec.getWeb()).saveScreenLastInfo(screenPath.toString(), null)
+                ((WebFacadeImpl) web).saveScreenLastInfo(screenPath.toString(), null)
             }
 
-            if (ri.type == "none") {
-                logger.info("Finished transition ${getScreenUrlInfo().getFullPathNameList()} in ${(System.currentTimeMillis() - transitionStartTime)/1000} seconds.")
+            if ("none".equals(ri.type)) {
+                if (logger.isInfoEnabled()) logger.info("Transition ${screenUrlInfo.getFullPathNameList().join("/")} in ${System.currentTimeMillis() - renderStartTime}ms, type none response")
                 return
             }
 
-            String url = ri.url ?: ""
-            String urlType = ri.urlType ?: "screen-path"
+            String url = ri.url != null ? ri.url : ""
+            String urlType = ri.urlType != null && ri.urlType.length() > 0 ? ri.urlType : "screen-path"
+            boolean isScreenLast = "screen-last".equals(ri.type)
 
-            // handle screen-last, etc
-            WebFacadeImpl wfi = null
-            if (ec.getWeb() != null && ec.getWeb() instanceof WebFacadeImpl) wfi = (WebFacadeImpl) ec.getWeb()
             if (wfi != null) {
-                if (ri.type == "screen-last" || ri.type == "screen-last-noparam") {
+                // handle screen-last, etc
+                if (isScreenLast || "screen-last-noparam".equals(ri.type)) {
                     String savedUrl =  wfi.getRemoveScreenLastPath()
                     urlType = "screen-path"
-                    if (savedUrl) {
+                    if (savedUrl != null && savedUrl.length() > 0) {
                         url = savedUrl
-                        wfi.removeScreenLastParameters(ri.type == "screen-last")
+                        wfi.removeScreenLastParameters(isScreenLast)
                     } else {
                         // try screen history when no last was saved
-                        List historyList = wfi.getScreenHistory()
-                        Map historyMap = historyList ? historyList.first() : null
-                        if (historyMap) {
-                            url = ri.type == "screen-last" ? historyMap.url : historyMap.urlNoParams
+                        List<Map> historyList = wfi.getScreenHistory()
+                        Map historyMap = historyList != null && historyList.size() > 0 ? historyList.first() : (Map) null
+                        if (historyMap != null) {
+                            url = isScreenLast ? historyMap.url : historyMap.urlNoParams
                             urlType = "plain"
                         } else {
                             // if no saved URL, just go to root/default; avoid getting stuck on Login screen, etc
@@ -373,32 +431,32 @@ class ScreenRenderImpl implements ScreenRender {
                         }
                     }
                 }
+
+                // save messages in session before redirecting so they can be displayed on the next screen
+                wfi.saveMessagesToSession()
+                if (ri.saveParameters) wfi.saveRequestParametersToSession()
+                if (ec.message.hasError()) wfi.saveErrorParametersToSession()
             }
 
             // either send a redirect for the response, if possible, or just render the response now
             if (this.response != null) {
-                // save messages in session before redirecting so they can be displayed on the next screen
-                if (wfi != null) {
-                    wfi.saveMessagesToSession()
-                    if (ri.saveParameters) wfi.saveRequestParametersToSession()
-                    if (ec.message.hasError()) wfi.saveErrorParametersToSession()
-                }
-
-                if (urlType == "plain") {
+                if ("plain".equals(urlType)) {
                     StringBuilder ps = new StringBuilder()
                     Map<String, String> pm = (Map<String, String>) ri.expandParameters(screenUrlInfo.getExtraPathNameList(), ec)
-                    if (pm) {
+                    if (pm != null && pm.size() > 0) {
                         for (Map.Entry<String, String> pme in pm.entrySet()) {
                             if (!pme.value) continue
                             if (ps.length() > 0) ps.append("&")
-                            ps.append(pme.key).append("=").append(urlCodec.encode(pme.value))
+                            ps.append(URLEncoder.encode(pme.key, "UTF-8")).append("=").append(URLEncoder.encode(pme.value, "UTF-8"))
                         }
                     }
                     String fullUrl = url
-                    if (ps) {
+                    if (ps.length() > 0) {
                         if (url.contains("?")) fullUrl += "&" else fullUrl += "?"
                         fullUrl += ps.toString()
                     }
+                    // NOTE: even if transition extension is json still send redirect when we just have a plain url
+                    if (logger.isInfoEnabled()) logger.info("Transition ${screenUrlInfo.getFullPathNameList().join("/")} in ${System.currentTimeMillis() - renderStartTime}ms, redirecting to plain URL: ${fullUrl}")
                     response.sendRedirect(fullUrl)
                 } else {
                     // default is screen-path
@@ -408,51 +466,60 @@ class ScreenRenderImpl implements ScreenRender {
                     Map savedParameters = wfi?.getSavedParameters()
                     UrlInstance.copySpecialParameters(savedParameters, fullUrl.getOtherParameterMap())
                     // screen parameters
-                    if (ri.type == "screen-last" && savedParameters && fullUrl.sui.getTargetScreen()?.getParameterMap()) {
-                        for (String parmName in fullUrl.sui.getTargetScreen().getParameterMap().keySet()) {
+                    Map<String, ScreenDefinition.ParameterItem> parameterItemMap = fullUrl.sui.getTargetScreen()?.getParameterMap()
+                    if (isScreenLast && savedParameters != null && savedParameters.size() > 0 &&
+                            parameterItemMap != null && parameterItemMap.size() > 0) {
+                        for (String parmName in parameterItemMap.keySet()) {
                             if (savedParameters.get(parmName))
                                 fullUrl.addParameter(parmName, savedParameters.get(parmName))
                         }
                     }
                     // transition parameters
-                    if (ri.type == "screen-last" && savedParameters && fullUrl.getTargetTransition()?.getParameterMap()) {
-                        for (String parmName in fullUrl.getTargetTransition().getParameterMap().keySet()) {
+                    Map<String, ScreenDefinition.ParameterItem> transParameterItemMap = fullUrl.getTargetTransition()?.getParameterMap()
+                    if (isScreenLast && savedParameters != null && savedParameters.size() > 0 &&
+                            transParameterItemMap != null && transParameterItemMap.size() > 0) {
+                        for (String parmName in transParameterItemMap.keySet()) {
                             if (savedParameters.get(parmName))
                                 fullUrl.addParameter(parmName, savedParameters.get(parmName))
                         }
                     }
-                    String fullUrlString = fullUrl.getUrlWithParams()
-                    logger.info("Finished transition ${getScreenUrlInfo().getFullPathNameList()} in ${(System.currentTimeMillis() - transitionStartTime)/1000} seconds, redirecting to ${fullUrlString}")
-                    response.sendRedirect(fullUrlString)
+
+                    if (!sendJsonRedirect(fullUrl)) {
+                        String fullUrlString = fullUrl.getMinimalPathUrlWithParams()
+                        if (logger.isInfoEnabled()) logger.info("Transition ${screenUrlInfo.getFullPathNameList().join("/")} in ${System.currentTimeMillis() - renderStartTime}ms, redirecting to screen path URL: ${fullUrlString}")
+                        response.sendRedirect(fullUrlString)
+                    }
                 }
             } else {
-                List<String> pathElements = url.split("/") as List
+                ArrayList<String> pathElements = new ArrayList<>(Arrays.asList(url.split("/")))
                 if (url.startsWith("/")) {
                     this.originalScreenPathNameList = pathElements
                 } else {
-                    this.originalScreenPathNameList = screenUrlInfo.preTransitionPathNameList
+                    this.originalScreenPathNameList = new ArrayList<>(screenUrlInfo.preTransitionPathNameList)
                     this.originalScreenPathNameList.addAll(pathElements)
                 }
                 // reset screenUrlInfo and call this again to start over with the new target
-                screenUrlInfo = null
+                screenUrlInfo = (ScreenUrlInfo) null
                 internalRender()
             }
         } else if (screenUrlInfo.fileResourceRef != null) {
+            ResourceReference fileResourceRef = screenUrlInfo.fileResourceRef
+
             long resourceStartTime = System.currentTimeMillis()
             long startTimeNanos = System.nanoTime()
 
-            TemplateRenderer tr = sfi.ecfi.resourceFacade.getTemplateRendererByLocation(screenUrlInfo.fileResourceRef.location)
+            TemplateRenderer tr = sfi.ecfi.resourceFacade.getTemplateRendererByLocation(fileResourceRef.location)
 
             // use the fileName to determine the content/mime type
-            String fileName = screenUrlInfo.fileResourceRef.fileName
+            String fileName = fileResourceRef.fileName
             // strip template extension(s) to avoid problems with trying to find content types based on them
             String fileContentType = sfi.ecfi.resourceFacade.getContentType(tr != null ? tr.stripTemplateExtension(fileName) : fileName)
 
-            boolean isBinary = sfi.ecfi.resourceFacade.isBinaryContentType(fileContentType)
-            // if (logger.traceEnabled) logger.trace("Content type for screen sub-content filename [${fileName}] is [${fileContentType}], default [${this.outputContentType}], is binary? ${isBinary}")
+            boolean isBinary = tr == null && ResourceReference.isBinaryContentType(fileContentType)
+            // if (isTraceEnabled) logger.trace("Content type for screen sub-content filename [${fileName}] is [${fileContentType}], default [${this.outputContentType}], is binary? ${isBinary}")
 
             if (isBinary) {
-                if (response) {
+                if (response != null) {
                     this.outputContentType = fileContentType
                     response.setContentType(this.outputContentType)
                     // static binary, tell the browser to cache it
@@ -461,29 +528,25 @@ class ScreenRenderImpl implements ScreenRender {
 
                     InputStream is
                     try {
-                        is = screenUrlInfo.fileResourceRef.openStream()
+                        is = fileResourceRef.openStream()
                         OutputStream os = response.outputStream
-                        int totalLen = StupidUtilities.copyStream(is, os)
+                        int totalLen = ObjectUtilities.copyStream(is, os)
 
-                        if (screenUrlInfo.targetScreen.screenNode.attribute('track-artifact-hit') != "false") {
-                            sfi.ecfi.countArtifactHit("screen-content", fileContentType, screenUrlInfo.fileResourceRef.location,
-                                    (ec.getWeb() != null ? ec.getWeb().requestParameters : null), resourceStartTime,
-                                    (System.nanoTime() - startTimeNanos)/1E6, (long) totalLen)
+                        if (screenUrlInfo.targetScreen.screenNode.attribute("track-artifact-hit") != "false") {
+                            sfi.ecfi.countArtifactHit(ArtifactExecutionInfo.AT_XML_SCREEN_CONTENT, fileContentType,
+                                    fileResourceRef.location, (web != null ? web.requestParameters : null),
+                                    resourceStartTime, (System.nanoTime() - startTimeNanos)/1E6, (long) totalLen)
                         }
-                        if (logger.traceEnabled) logger.trace("Sent binary response of length ${totalLen} from file ${screenUrlInfo.fileResourceRef.location} for request to ${screenUrlInstance.url}")
-                        return
+                        if (isTraceEnabled) logger.trace("Sent binary response of length ${totalLen} from file ${fileResourceRef.location} for request to ${screenUrlInstance.url}")
                     } finally {
                         if (is != null) is.close()
                     }
                 } else {
-                    throw new IllegalArgumentException("Tried to get binary content at [${screenUrlInfo.fileResourcePathList}] under screen [${screenUrlInfo.targetScreen.location}], but there is no HTTP response available")
+                    throw new IllegalArgumentException("Tried to get binary content at ${screenUrlInfo.fileResourcePathList} under screen ${screenUrlInfo.targetScreen.location}, but there is no HTTP response available")
                 }
-            }
-
-            // not binary, render as text
-            if (screenUrlInfo.targetScreen.screenNode.attribute('include-child-content') != "true") {
+            } else if (!"true".equals(screenUrlInfo.targetScreen.screenNode.attribute("include-child-content"))) {
                 // not a binary object (hopefully), read it and write it to the writer
-                if (fileContentType) this.outputContentType = fileContentType
+                if (fileContentType != null && fileContentType.length() > 0) this.outputContentType = fileContentType
                 if (response != null) {
                     response.setContentType(this.outputContentType)
                     response.setCharacterEncoding(this.characterEncoding)
@@ -492,30 +555,31 @@ class ScreenRenderImpl implements ScreenRender {
                 if (tr != null) {
                     // if requires a render, don't cache and make it private
                     if (response != null) response.addHeader("Cache-Control", "no-cache, no-store, must-revalidate, private")
-                    tr.render(screenUrlInfo.fileResourceRef.location, writer)
+                    tr.render(fileResourceRef.location, writer)
                 } else {
                     // static text, tell the browser to cache it
                     // TODO: make this configurable?
                     if (response != null) response.addHeader("Cache-Control", "max-age=3600, must-revalidate, public")
                     // no renderer found, just grab the text (cached) and throw it to the writer
-                    String text = sfi.ecfi.resourceFacade.getLocationText(screenUrlInfo.fileResourceRef.location, true)
-                    if (text) {
+                    String text = sfi.ecfi.resourceFacade.getLocationText(fileResourceRef.location, true)
+                    if (text != null && text.length() > 0) {
                         // NOTE: String.length not correct for byte length
                         String charset = response?.getCharacterEncoding() ?: "UTF-8"
-                        int length = text.getBytes(charset).length
-                        if (response != null) response.setContentLength(length)
 
-                        if (logger.traceEnabled) logger.trace("Sending text response of length ${length} with ${charset} encoding from file ${screenUrlInfo.fileResourceRef.location} for request to ${screenUrlInstance.url}")
+                        // getBytes() is pretty slow, seems to be only way to get accurate length, perhaps better without it (definitely faster)
+                        // int length = text.getBytes(charset).length
+                        // if (response != null) response.setContentLength(length)
+
+                        if (isTraceEnabled) logger.trace("Sending text response with ${charset} encoding from file ${fileResourceRef.location} for request to ${screenUrlInstance.url}")
 
                         writer.write(text)
-
-                        if (screenUrlInfo.targetScreen.screenNode.attribute('track-artifact-hit') != "false") {
-                            sfi.ecfi.countArtifactHit("screen-content", fileContentType, screenUrlInfo.fileResourceRef.location,
-                                    (ec.getWeb() != null ? ec.getWeb().requestParameters : null), resourceStartTime,
-                                    (System.nanoTime() - startTimeNanos)/1E6, (long) length)
+                        if (!"false".equals(screenUrlInfo.targetScreen.screenNode.attribute("track-artifact-hit"))) {
+                            sfi.ecfi.countArtifactHit(ArtifactExecutionInfo.AT_XML_SCREEN_CONTENT, fileContentType,
+                                    fileResourceRef.location, (web != null ? web.requestParameters : null),
+                                    resourceStartTime, (System.nanoTime() - startTimeNanos)/1E6, (long) text.length())
                         }
                     } else {
-                        logger.warn("Not sending text response from file [${screenUrlInfo.fileResourceRef.location}] for request to [${screenUrlInstance.url}] because no text was found in the file.")
+                        logger.warn("Not sending text response from file [${fileResourceRef.location}] for request to [${screenUrlInstance.url}] because no text was found in the file.")
                     }
                 }
             } else {
@@ -524,6 +588,8 @@ class ScreenRenderImpl implements ScreenRender {
             }
         } else {
             doActualRender()
+            if (response != null && logger.isInfoEnabled())
+                logger.info("${screenUrlInfo.getFullPathNameList().join("/")} in ${(System.currentTimeMillis()-renderStartTime)}ms (${response.getContentType()}) session ${request.session.id}")
         }
     }
 
@@ -532,35 +598,33 @@ class ScreenRenderImpl implements ScreenRender {
         // check authz first, including anonymous-* handling so that permissions and auth are in place
         // NOTE: don't require authz if the screen doesn't require auth
         MNode screenNode = sd.getScreenNode()
-        String requireAuthentication = screenNode.attribute('require-authentication')
-        ArtifactExecutionInfoImpl aei = new ArtifactExecutionInfoImpl(sd.location, "AT_XML_SCREEN", "AUTHZA_VIEW")
-        ec.artifactExecutionImpl.pushInternal(aei, !screenDefIterator.hasNext() ? (!requireAuthentication || requireAuthentication == "true") : false)
-
-        if (sd.getTenantsAllowed() && !sd.getTenantsAllowed().contains(ec.getTenantId()))
-            throw new ArtifactAuthorizationException("The screen ${sd.getScreenName()} is not available to tenant [${ec.getTenantId()}]")
+        String requireAuthentication = screenNode.attribute("require-authentication")
+        ArtifactExecutionInfoImpl aei = new ArtifactExecutionInfoImpl(sd.location,
+                ArtifactExecutionInfo.AT_XML_SCREEN, ArtifactExecutionInfo.AUTHZA_VIEW, outputContentType)
+        ec.artifactExecutionFacade.pushInternal(aei, !screenDefIterator.hasNext() ? (!requireAuthentication || requireAuthentication == "true") : false)
 
         boolean loggedInAnonymous = false
-        if (requireAuthentication == "anonymous-all") {
-            ec.artifactExecution.setAnonymousAuthorizedAll()
-            loggedInAnonymous = ec.getUser().loginAnonymousIfNoUser()
-        } else if (requireAuthentication == "anonymous-view") {
-            ec.artifactExecution.setAnonymousAuthorizedView()
-            loggedInAnonymous = ec.getUser().loginAnonymousIfNoUser()
+        try {
+            if (requireAuthentication == "anonymous-all") {
+                ec.artifactExecutionFacade.setAnonymousAuthorizedAll()
+                loggedInAnonymous = ec.userFacade.loginAnonymousIfNoUser()
+            } else if (requireAuthentication == "anonymous-view") {
+                ec.artifactExecutionFacade.setAnonymousAuthorizedView()
+                loggedInAnonymous = ec.userFacade.loginAnonymousIfNoUser()
+            }
+
+            if (runAlwaysActions && sd.alwaysActions != null) sd.alwaysActions.run(ec)
+            if (runPreActions && sd.preActions != null) sd.preActions.run(ec)
+
+            if (screenDefIterator.hasNext()) recursiveRunActions(screenDefIterator, runAlwaysActions, runPreActions)
+        } finally {
+            // all done so pop the artifact info; don't bother making sure this is done on errors/etc like in a finally clause because if there is an error this will help us know how we got there
+            ec.artifactExecutionFacade.pop(aei)
+            if (loggedInAnonymous) ec.userFacade.logoutAnonymousOnly()
         }
-
-        if (runAlwaysActions && sd.alwaysActions != null) sd.alwaysActions.run(ec)
-        if (runPreActions && sd.preActions != null) sd.preActions.run(ec)
-
-        if (screenDefIterator.hasNext()) recursiveRunActions(screenDefIterator, runAlwaysActions, runPreActions)
-
-        // all done so pop the artifact info; don't bother making sure this is done on errors/etc like in a finally clause because if there is an error this will help us know how we got there
-        ec.artifactExecution.pop(aei)
-        if (loggedInAnonymous) ((UserFacadeImpl) ec.getUser()).logoutAnonymousOnly()
     }
 
     void doActualRender() {
-        long screenStartTime = System.currentTimeMillis()
-        long startTimeNanos = System.nanoTime()
         boolean beganTransaction = screenUrlInfo.beginTransaction ? sfi.ecfi.transactionFacade.begin(null) : false
         try {
             // make sure this (sri) is in the context before running actions
@@ -581,6 +645,12 @@ class ScreenRenderImpl implements ScreenRender {
                 response.setCharacterEncoding(this.characterEncoding)
                 // if requires a render, don't cache and make it private
                 response.addHeader("Cache-Control", "no-cache, no-store, must-revalidate, private")
+
+                String filename = ec.context.saveFilename as String
+                if (filename) {
+                    String utfFilename = StringUtilities.encodeAsciiFilename(filename)
+                    response.addHeader("Content-Disposition", "attachment; filename=\"${filename}\"; filename*=utf-8''${utfFilename}")
+                }
             }
 
             // for inherited permissions to work, walk the screen list before the screenRenderDefList and artifact push
@@ -591,8 +661,6 @@ class ScreenRenderImpl implements ScreenRender {
                 for (int i = 0; i < screenUrlInfo.renderPathDifference; i++) {
                     ScreenDefinition permSd = screenUrlInfo.screenPathDefList.get(i)
 
-                    if (permSd.getTenantsAllowed() && !permSd.getTenantsAllowed().contains(ec.getTenantId()))
-                        throw new ArtifactAuthorizationException("The screen ${permSd.getScreenName()} is not available to tenant [${ec.getTenantId()}]")
                     // check the subscreens item for this screen (valid in context)
                     if (i > 0) {
                         String curPathName = screenUrlInfo.fullPathNameList.get(i - 1) // one lower in path as it doesn't have root screen
@@ -606,8 +674,9 @@ class ScreenRenderImpl implements ScreenRender {
                         }
                     }
 
-                    ArtifactExecutionInfoImpl aei = new ArtifactExecutionInfoImpl(permSd.location, "AT_XML_SCREEN", "AUTHZA_VIEW")
-                    ec.artifactExecutionImpl.pushInternal(aei, false)
+                    ArtifactExecutionInfoImpl aei = new ArtifactExecutionInfoImpl(permSd.location,
+                            ArtifactExecutionInfo.AT_XML_SCREEN, ArtifactExecutionInfo.AUTHZA_VIEW, outputContentType)
+                    ec.artifactExecutionFacade.pushInternal(aei, false)
                     aeiList.add(aei)
                 }
             }
@@ -630,10 +699,11 @@ class ScreenRenderImpl implements ScreenRender {
             }
 
             // we've run always and pre actions, it's now or never for required parameters so check them
-            for (ScreenDefinition sd in screenUrlInfo.screenRenderDefList) {
+
+            if (!sfi.isRenderModeSkipActions(renderMode)) for (ScreenDefinition sd in screenUrlInfo.screenRenderDefList) {
                 for (ScreenDefinition.ParameterItem pi in sd.getParameterMap().values()) {
-                    if (pi.required && ec.context.get(pi.name) == null) {
-                        ec.message.addError("Required parameter missing (${pi.name})")
+                    if (pi.required && ec.context.getByString(pi.name) == null) {
+                        ec.message.addError(ec.resource.expand("Required parameter missing (${pi.name})","",[pi:pi]))
                         logger.warn("Tried to render screen [${sd.getLocation()}] without required parameter [${pi.name}], error message added and adding to stop list to not render")
                         stopRenderScreenLocations.add(sd.getLocation())
                     }
@@ -646,8 +716,8 @@ class ScreenRenderImpl implements ScreenRender {
             renderStartDef.render(this, screenUrlInfo.screenRenderDefList.size() == 1)
 
             // if these aren't already cleared it out means they haven't been included in the output, so add them here
-            if (afterScreenWriter) internalWriter.write(afterScreenWriter.toString())
-            if (scriptWriter) {
+            if (afterScreenWriter != null) internalWriter.write(afterScreenWriter.toString())
+            if (scriptWriter != null) {
                 internalWriter.write("\n<script>\n")
                 internalWriter.write(scriptWriter.toString())
                 internalWriter.write("\n</script>\n")
@@ -666,12 +736,6 @@ class ScreenRenderImpl implements ScreenRender {
             WebFacade webFacade = ec.getWeb()
             // if we began a tx commit it
             if (beganTransaction && sfi.ecfi.transactionFacade.isTransactionInPlace()) sfi.ecfi.transactionFacade.commit()
-            // track the screen artifact hit
-            if (screenUrlInfo.targetScreen.screenNode.attribute('track-artifact-hit') != "false") {
-                sfi.ecfi.countArtifactHit("screen", this.outputContentType, screenUrlInfo.screenRenderDefList.last().getLocation(),
-                        (webFacade != null ? webFacade.requestParameters : null), screenStartTime,
-                        (System.nanoTime() - startTimeNanos)/1E6, null)
-            }
             // save the screen history
             if (webFacade != null && webFacade instanceof WebFacadeImpl) {
                 ((WebFacadeImpl) webFacade).saveScreenHistory(screenUrlInstance)
@@ -680,29 +744,30 @@ class ScreenRenderImpl implements ScreenRender {
     }
 
     boolean checkWebappSettings(ScreenDefinition currentSd) {
-        if (!request) return true
+        if (request == null) return true
 
-        if (currentSd.webSettingsNode?.attribute('allow-web-request') == "false")
+        MNode webSettingsNode = currentSd.webSettingsNode
+        if (webSettingsNode != null && "false".equals(webSettingsNode.attribute("allow-web-request")))
             throw new IllegalArgumentException("The screen [${currentSd.location}] cannot be used in a web request (allow-web-request=false).")
 
-        String mimeType = (String) currentSd.webSettingsNode?.attribute('mime-type')
-        if (mimeType) this.outputContentType = mimeType
-        String characterEncoding = (String) currentSd.webSettingsNode?.attribute('character-encoding')
-        if (characterEncoding) this.characterEncoding = characterEncoding
+        String mimeType = webSettingsNode != null ? webSettingsNode.attribute("mime-type") : null
+        if (mimeType != null && mimeType.length() > 0) this.outputContentType = mimeType
+        String characterEncoding = webSettingsNode != null ? webSettingsNode.attribute("character-encoding") : null
+        if (characterEncoding != null && characterEncoding.length() > 0) this.characterEncoding = characterEncoding
 
         // if screen requires auth and there is not active user redirect to login screen, save this request
-        if (logger.traceEnabled) logger.trace("Checking screen [${currentSd.location}] for require-authentication, current user is [${ec.user.userId}]")
+        // if (isTraceEnabled) logger.trace("Checking screen [${currentSd.location}] for require-authentication, current user is [${ec.user.userId}]")
 
-        WebFacadeImpl wfi = null
-        if (ec.getWeb() != null && ec.getWeb() instanceof WebFacadeImpl) wfi = (WebFacadeImpl) ec.getWeb()
-        String requireAuthentication = (String) currentSd.screenNode?.attribute('require-authentication')
-        if ((!requireAuthentication || requireAuthentication == "true")
-                && !ec.getUser().getUserId() && !((UserFacadeImpl) ec.getUser()).getLoggedInAnonymous()) {
-            logger.info("Screen at location [${currentSd.location}], which is part of [${screenUrlInfo.fullPathNameList}] under screen [${screenUrlInfo.fromSd.location}] requires authentication but no user is currently logged in.")
+        WebFacadeImpl wfi = ec.getWebImpl()
+        String requireAuthentication = currentSd.screenNode?.attribute("require-authentication")
+        String userId = ec.getUser().getUserId()
+        if ((requireAuthentication == null || requireAuthentication.length() == 0 || requireAuthentication == "true")
+                && (userId == null || userId.length() == 0) && !ec.userFacade.getLoggedInAnonymous()) {
+            if (logger.isInfoEnabled()) logger.info("Screen at location ${currentSd.location}, which is part of ${screenUrlInfo.fullPathNameList} under screen ${screenUrlInfo.fromSd.location} requires authentication but no user is currently logged in.")
             // save the request as a save-last to use after login
             if (wfi != null && screenUrlInfo.fileResourceRef == null) {
                 StringBuilder screenPath = new StringBuilder()
-                for (String pn in screenUrlInfo.fullPathNameList) screenPath.append("/").append(pn)
+                for (String pn in originalScreenPathNameList) screenPath.append("/").append(pn)
                 wfi.saveScreenLastInfo(screenPath.toString(), null)
                 // save messages in session before redirecting so they can be displayed on the next screen
                 wfi.saveMessagesToSession()
@@ -711,27 +776,63 @@ class ScreenRenderImpl implements ScreenRender {
             // find the last login path from screens in path (whether rendered or not)
             String loginPath = "/Login"
             for (ScreenDefinition sd in screenUrlInfo.screenPathDefList) {
-                String loginPathAttr = (String) sd.screenNode.attribute('login-path')
+                String loginPathAttr = (String) sd.screenNode.attribute("login-path")
                 if (loginPathAttr) loginPath = loginPathAttr
             }
 
-            if (screenUrlInfo.isLastStandalone() || screenUrlInstance.getTargetTransition() != null) {
-                // respond with 401 and the login screen instead of a redirect; JS client libraries handle this much better
-                List<String> pathElements = loginPath.split("/") as List
-                if (loginPath.startsWith("/")) {
-                    this.originalScreenPathNameList = pathElements
+            if (screenUrlInfo.lastStandalone != 0 || screenUrlInstance.getTargetTransition() != null) {
+                // just send a 401 response, should always be for data submit, content rendering, JS AJAX requests, etc
+                if (response != null) response.sendError(401, "Authentication required")
+                return false
+
+                /* TODO: remove all of this, we don't need it
+                ArrayList<String> pathElements = new ArrayList<>()
+                if (!loginPath.startsWith("/")) {
+                    pathElements.addAll(screenUrlInfo.preTransitionPathNameList)
+                    pathElements.addAll(Arrays.asList(loginPath.split("/")))
                 } else {
-                    this.originalScreenPathNameList = screenUrlInfo.preTransitionPathNameList
-                    this.originalScreenPathNameList.addAll(pathElements)
+                    pathElements.addAll(Arrays.asList(loginPath.substring(1).split("/")))
                 }
-                // reset screenUrlInfo and call this again to start over with the new target
-                screenUrlInfo = null
-                internalRender()
-                if (response != null) response.setStatus(HttpServletResponse.SC_UNAUTHORIZED)
+
+                // BEGIN what used to be only for requests for a json response
+                Map<String, Object> responseMap = new HashMap<>()
+                if (ec.message.getMessages().size() > 0) responseMap.put("messages", ec.message.messages)
+                if (ec.message.getErrors().size() > 0) responseMap.put("errors", ec.message.errors)
+                if (ec.message.getValidationErrors().size() > 0) {
+                    List<ValidationError> valErrorList = ec.message.getValidationErrors()
+                    int valErrorListSize = valErrorList.size()
+                    ArrayList<Map> valErrMapList = new ArrayList<>(valErrorListSize)
+                    for (int i = 0; i < valErrorListSize; i++) valErrMapList.add(valErrorList.get(i).getMap())
+                    responseMap.put("validationErrors", valErrMapList)
+                }
+
+                Map parms = new HashMap()
+                if (ec.web.requestParameters != null) parms.putAll(ec.web.requestParameters)
+                // if (ec.web.requestAttributes != null) parms.putAll(ec.web.requestAttributes)
+                responseMap.put("currentParameters", ContextJavaUtil.unwrapMap(parms))
+
+                responseMap.put("redirectUrl", '/' + pathElements.join('/'))
+                // logger.warn("Sending JSON no authc response: ${responseMap}")
+                ec.web.sendJsonResponse(responseMap)
+
+                // END what used to be only for requests for a json response
+                */
+
+                /* better to always send a JSON response as above instead of sometimes sending the Login screen, other that status response usually ignored anyway
+                if ("json".equals(screenUrlInfo.targetTransitionExtension) || "application/json".equals(request?.getHeader("Accept"))) {
+                } else {
+                    // respond with 401 and the login screen instead of a redirect; JS client libraries handle this much better
+                    this.originalScreenPathNameList = pathElements
+                    // reset screenUrlInfo and call this again to start over with the new target
+                    screenUrlInfo = null
+                    internalRender()
+                }
+                */
+
                 return false
             } else {
                 // now prepare and send the redirect
-                ScreenUrlInfo suInfo = ScreenUrlInfo.getScreenUrlInfo(this, rootScreenDef, [], loginPath, false)
+                ScreenUrlInfo suInfo = ScreenUrlInfo.getScreenUrlInfo(this, rootScreenDef, new ArrayList<String>(), loginPath, 0)
                 UrlInstance urlInstance = suInfo.getInstance(this, false)
                 response.sendRedirect(urlInstance.url)
                 return false
@@ -739,9 +840,10 @@ class ScreenRenderImpl implements ScreenRender {
         }
 
         // if request not secure and screens requires secure redirect to https
-        if (currentSd.webSettingsNode?.attribute('require-encryption') != "false" &&
-                getWebappNode().attribute('https-enabled') != "false" && !request.isSecure()) {
-            logger.info("Screen at location [${currentSd.location}], which is part of [${screenUrlInfo.fullPathNameList}] under screen [${screenUrlInfo.fromSd.location}] requires an encrypted/secure connection but the request is not secure, sending redirect to secure.")
+        ExecutionContextFactoryImpl.WebappInfo webappInfo = ec.ecfi.getWebappInfo(webappName)
+        if (!request.isSecure() && (webSettingsNode == null || webSettingsNode.attribute("require-encryption") != "false") &&
+                webappInfo != null && webappInfo.httpsEnabled) {
+            if (logger.isInfoEnabled()) logger.info("Screen at location ${currentSd.location}, which is part of ${screenUrlInfo.fullPathNameList} under screen ${screenUrlInfo.fromSd.location} requires an encrypted/secure connection but the request is not secure, sending redirect to secure.")
             // save messages in session before redirecting so they can be displayed on the next screen
             if (wfi != null) wfi.saveMessagesToSession()
             // redirect to the same URL this came to
@@ -752,26 +854,28 @@ class ScreenRenderImpl implements ScreenRender {
         return true
     }
 
-    MNode getWebappNode() {
-        if (webappName == null || webappName.length() == 0) return null
-        return sfi.ecfi.confXmlRoot.first("webapp-list").first({ MNode it -> it.name == "webapp" && it.attribute("name") == webappName })
-    }
-
     boolean doBoundaryComments() {
         if (screenPathIndex == 0) return false
-        if (boundaryComments != null) return boundaryComments
-        boundaryComments = sfi.ecfi.confXmlRoot.first("screen-facade").attribute("boundary-comments") == "true"
+        if (boundaryComments != null) return boundaryComments.booleanValue()
+        boundaryComments = "true".equals(sfi.ecfi.confXmlRoot.first("screen-facade").attribute("boundary-comments"))
         return boundaryComments
     }
 
     ScreenDefinition getRootScreenDef() { return rootScreenDef }
-    ScreenDefinition getActiveScreenDef() { return overrideActiveScreenDef ?: screenUrlInfo.screenRenderDefList.get(screenPathIndex) }
+    ScreenDefinition getActiveScreenDef() {
+        if (overrideActiveScreenDef != null) return overrideActiveScreenDef
+        return (ScreenDefinition) screenUrlInfo.screenRenderDefList.get(screenPathIndex)
+    }
+    String getActiveScreenPathName() {
+        int fullPathIndex = screenUrlInfo.renderPathDifference + screenPathIndex - 1
+        return screenUrlInfo.fullPathNameList.get(fullPathIndex)
+    }
 
-    List<String> getActiveScreenPath() {
+    ArrayList<String> getActiveScreenPath() {
         // handle case where root screen is first/zero in list versus a standalone screen
         int fullPathIndex = screenUrlInfo.renderPathDifference + screenPathIndex
-        if (fullPathIndex == 0) return []
-        List<String> activePath = screenUrlInfo.fullPathNameList[0..fullPathIndex-1]
+        if (fullPathIndex == 0) return new ArrayList<String>()
+        ArrayList<String> activePath = new ArrayList<>(screenUrlInfo.fullPathNameList[0..fullPathIndex-1])
         // logger.info("===== activePath=${activePath}, rpd=${screenUrlInfo.renderPathDifference}, spi=${screenPathIndex}, fpi=${fullPathIndex}\nroot: ${screenUrlInfo.rootSd.location}\ntarget: ${screenUrlInfo.targetScreen.location}\nfrom: ${screenUrlInfo.fromSd.location}\nfrom path: ${screenUrlInfo.fromPathList}")
         return activePath
     }
@@ -781,7 +885,7 @@ class ScreenRenderImpl implements ScreenRender {
         if ((screenPathIndex+1) >= screenUrlInfo.screenRenderDefList.size()) {
             if (screenUrlInfo.fileResourceRef) {
                 // NOTE: don't set this.outputContentType, when including in a screen the screen determines the type
-                sfi.ecfi.resourceFacade.renderTemplateInCurrentContext(screenUrlInfo.fileResourceRef.location, writer)
+                sfi.ecfi.resourceFacade.template(screenUrlInfo.fileResourceRef.location, writer)
                 return ""
             } else {
                 return "Tried to render subscreen in screen [${getActiveScreenDef()?.location}] but there is no subscreens.@default-item, and no more valid subscreen names in the screen path [${screenUrlInfo.fullPathNameList}]"
@@ -789,8 +893,6 @@ class ScreenRenderImpl implements ScreenRender {
         }
 
         ScreenDefinition screenDef = screenUrlInfo.screenRenderDefList.get(screenPathIndex + 1)
-        if (screenDef.getTenantsAllowed() && !screenDef.getTenantsAllowed().contains(ec.getTenantId()))
-            throw new ArtifactAuthorizationException("The screen ${screenDef.getScreenName()} is not available to tenant [${ec.getTenantId()}]")
         // check the subscreens item for this screen (valid in context)
         int i = screenPathIndex + screenUrlInfo.renderPathDifference
         if (i > 0) {
@@ -823,16 +925,21 @@ class ScreenRenderImpl implements ScreenRender {
     }
 
     Template getTemplate() {
-        if (macroTemplateLocation) {
+        if (macroTemplateLocation != null) {
             return sfi.getTemplateByLocation(macroTemplateLocation)
         } else {
-            String overrideTemplateLocation = null
+            String overrideTemplateLocation = (String) null
             // go through the screenPathDefList instead screenRenderDefList so that parent screen can override template
             //     even if it isn't rendered to decorate subscreen
-            for (ScreenDefinition sd in screenUrlInfo.screenPathDefList)
-                overrideTemplateLocation = sd.getMacroTemplateLocation(renderMode)
+            ArrayList<ScreenDefinition> screenPathDefList = screenUrlInfo.screenPathDefList
+            int screenPathDefListSize = screenPathDefList.size()
+            for (int i = 0; i < screenPathDefListSize; i++) {
+                ScreenDefinition sd = (ScreenDefinition) screenPathDefList.get(i)
+                String curLocation = sd.getMacroTemplateLocation(renderMode)
+                if (curLocation != null && curLocation.length() > 0) overrideTemplateLocation = curLocation
+            }
 
-            if (overrideTemplateLocation) {
+            if (overrideTemplateLocation != null) {
                 return sfi.getTemplateByLocation(overrideTemplateLocation)
             } else {
                 return sfi.getTemplateByMode(renderMode)
@@ -844,7 +951,7 @@ class ScreenRenderImpl implements ScreenRender {
         ScreenDefinition sd = getActiveScreenDef()
         try {
             ScreenSection section = sd.getSection(sectionName)
-            if (!section) throw new IllegalArgumentException("No section with name [${sectionName}] in screen [${sd.location}]")
+            if (section == null) throw new IllegalArgumentException("No section with name [${sectionName}] in screen [${sd.location}]")
             writer.flush()
             section.render(this)
             writer.flush()
@@ -857,107 +964,24 @@ class ScreenRenderImpl implements ScreenRender {
         return ""
     }
 
-    String startFormListRow(String formName, Object listEntry, int index, boolean hasNext) {
-        ScreenDefinition sd = getActiveScreenDef()
-        ScreenForm form = sd.getForm(formName)
-        if (form == null) throw new IllegalArgumentException("No form with name [${formName}] in screen [${sd.location}]")
-        ((ContextStack) ec.context).push()
-        form.runFormListRowActions(this, listEntry, index, hasNext)
-        // NOTE: this returns an empty String so that it can be used in an FTL interpolation, but nothing is written
-        return ""
-    }
-    String endFormListRow() {
-        ((ContextStack) ec.context).pop()
-        // NOTE: this returns an empty String so that it can be used in an FTL interpolation, but nothing is written
-        return ""
-    }
-    String safeCloseList(Object listObject) {
-        if (listObject instanceof EntityListIterator) ((EntityListIterator) listObject).close()
-        // NOTE: this returns an empty String so that it can be used in an FTL interpolation, but nothing is written
-        return ""
-    }
     MNode getFormNode(String formName) {
+        FormInstance fi = getFormInstance(formName)
+        if (fi == null) return null
+        return fi.getFormNode()
+    }
+    FormInstance getFormInstance(String formName) {
         ScreenDefinition sd = getActiveScreenDef()
         String nodeCacheKey = sd.getLocation() + "#" + formName
         // NOTE: this is cached in the context of the renderer for multiple accesses; because of form overrides may not
         // be valid outside the scope of a single screen render
-        MNode formNode = screenFormNodeCache.get(nodeCacheKey)
+        FormInstance formNode = screenFormCache.get(nodeCacheKey)
         if (formNode == null) {
             ScreenForm form = sd.getForm(formName)
             if (!form) throw new IllegalArgumentException("No form with name [${formName}] in screen [${sd.location}]")
-            formNode = form.getFormNode()
-            screenFormNodeCache.put(nodeCacheKey, formNode)
+            formNode = form.getFormInstance()
+            screenFormCache.put(nodeCacheKey, formNode)
         }
         return formNode
-    }
-    FtlNodeWrapper getFtlFormNode(String formName) { return FtlNodeWrapper.wrapNode(getFormNode(formName)) }
-    List<FtlNodeWrapper> getFtlFormFieldLayoutNonReferencedFieldList(String formName) {
-        ScreenDefinition sd = getActiveScreenDef()
-        List<MNode> fieldNodeList = sd.getForm(formName).getFieldLayoutNonReferencedFieldList()
-        List<FtlNodeWrapper> fieldFtlNodeList = []
-        for (MNode fieldNode in fieldNodeList) fieldFtlNodeList.add(FtlNodeWrapper.wrapNode(fieldNode))
-        return fieldFtlNodeList
-    }
-    List<FtlNodeWrapper> getFtlFormListColumnNonReferencedHiddenFieldList(String formName) {
-        ScreenDefinition sd = getActiveScreenDef()
-        List<MNode> fieldNodeList = sd.getForm(formName).getColumnNonReferencedHiddenFieldList()
-        List<FtlNodeWrapper> fieldFtlNodeList = []
-        for (MNode fieldNode in fieldNodeList) fieldFtlNodeList.add(FtlNodeWrapper.wrapNode(fieldNode))
-        return fieldFtlNodeList
-    }
-
-
-    boolean isFormUpload(String formName) {
-        MNode cachedFormNode = this.getFormNode(formName)
-        return getActiveScreenDef().getForm(formName).isUpload(cachedFormNode)
-    }
-    boolean isFormHeaderForm(String formName) {
-        MNode cachedFormNode = this.getFormNode(formName)
-        return getActiveScreenDef().getForm(formName).isFormHeaderForm(cachedFormNode)
-    }
-
-    String getFormFieldValidationClasses(String formName, String fieldName) {
-        ScreenForm form = getActiveScreenDef().getForm(formName)
-        MNode cachedFormNode = getFormNode(formName)
-        MNode validateNode = form.getFieldValidateNode(fieldName, cachedFormNode)
-        if (validateNode == null) return ""
-
-        Set<String> vcs = new HashSet()
-        if (validateNode.name == "parameter") {
-            MNode parameterNode = validateNode
-            if (parameterNode.attribute('required') == "true") vcs.add("required")
-            if (parameterNode.hasChild("number-integer")) vcs.add("number")
-            if (parameterNode.hasChild("number-decimal")) vcs.add("number")
-            if (parameterNode.hasChild("text-email")) vcs.add("email")
-            if (parameterNode.hasChild("text-url")) vcs.add("url")
-            if (parameterNode.hasChild("text-digits")) vcs.add("digits")
-            if (parameterNode.hasChild("credit-card")) vcs.add("creditcard")
-
-            String type = parameterNode.attribute('type')
-            if (type && (type.endsWith("BigDecimal") || type.endsWith("BigInteger") || type.endsWith("Long") ||
-                    type.endsWith("Integer") || type.endsWith("Double") || type.endsWith("Float") ||
-                    type.endsWith("Number"))) vcs.add("number")
-        } else if (validateNode.name == "field") {
-            MNode fieldNode = validateNode
-            String type = fieldNode.attribute('type')
-            if (type && (type.startsWith("number-") || type.startsWith("currency-"))) vcs.add("number")
-            // bad idea, for create forms with optional PK messes it up: if (fieldNode."@is-pk" == "true") vcs.add("required")
-        }
-
-        StringBuilder sb = new StringBuilder()
-        for (String vc in vcs) { if (sb) sb.append(" "); sb.append(vc); }
-        return sb.toString()
-    }
-
-    Map getFormFieldValidationRegexpInfo(String formName, String fieldName) {
-        ScreenForm form = getActiveScreenDef().getForm(formName)
-        MNode cachedFormNode = getFormNode(formName)
-        MNode validateNode = form.getFieldValidateNode(fieldName, cachedFormNode)
-        if (validateNode?.hasChild("matches")) {
-            MNode matchesNode = validateNode.first("matches")
-            return [regexp:matchesNode.attribute('regexp'), message:matchesNode.attribute('message')]
-        }
-        return null
     }
 
     String renderIncludeScreen(String location, String shareScopeStr) {
@@ -992,9 +1016,9 @@ class ScreenRenderImpl implements ScreenRender {
     }
 
     String renderText(String location, String isTemplateStr) {
-        boolean isTemplate = (isTemplateStr != "false")
+        boolean isTemplate = !"false".equals(isTemplateStr)
 
-        if (!location || location == "null") {
+        if (location == null || location.length() == 0 || "null".equals(location)) {
             logger.warn("Not rendering text in screen [${getActiveScreenDef().location}], location was empty")
             return ""
         }
@@ -1004,7 +1028,7 @@ class ScreenRenderImpl implements ScreenRender {
             ContextStack cs = (ContextStack) ec.context
             cs.push()
             cs.put("sri", this)
-            sfi.ecfi.resourceFacade.renderTemplateInCurrentContext(location, writer)
+            sfi.ecfi.resourceFacade.template(location, writer)
             cs.pop()
             writer.flush()
             // NOTE: this returns a String so that it can be used in an FTL interpolation, but it always writes to the writer
@@ -1053,7 +1077,7 @@ class ScreenRenderImpl implements ScreenRender {
             // logger.warn("========== DID NOT find cached ScreenUrlInfo ${key}")
         }
 
-        ScreenUrlInfo sui = ScreenUrlInfo.getScreenUrlInfo(this, null, null, subscreenPath, null)
+        ScreenUrlInfo sui = ScreenUrlInfo.getScreenUrlInfo(this, null, null, subscreenPath, 0)
         subscreenUrlInfos.put(key, sui)
         return sui
     }
@@ -1061,23 +1085,15 @@ class ScreenRenderImpl implements ScreenRender {
     UrlInstance buildUrl(String subscreenPath) {
         return buildUrlInfo(subscreenPath).getInstance(this, null)
     }
-
-    UrlInstance buildUrl(ScreenDefinition fromSd, List<String> fromPathList, String subscreenPathOrig) {
+    UrlInstance buildUrl(ScreenDefinition fromSd, ArrayList<String> fromPathList, String subscreenPathOrig) {
         String subscreenPath = subscreenPathOrig?.contains("\${") ? ec.resource.expand(subscreenPathOrig, "") : subscreenPathOrig
-        ScreenUrlInfo ui = ScreenUrlInfo.getScreenUrlInfo(this, fromSd, fromPathList, subscreenPath, null)
+        ScreenUrlInfo ui = ScreenUrlInfo.getScreenUrlInfo(this, fromSd, fromPathList, subscreenPath, 0)
         return ui.getInstance(this, null)
     }
 
-    UrlInstance makeUrlByType(String origUrl, String urlType, FtlNodeWrapper parameterParentNodeWrapper,
-                                String expandTransitionUrlString) {
-        return makeUrlByTypeGroovyNode(origUrl, urlType, parameterParentNodeWrapper?.getMNode(), expandTransitionUrlString)
-    }
-    UrlInstance makeUrlByTypeGroovyNode(String origUrl, String urlType, MNode parameterParentNode,
-                                String expandTransitionUrlString) {
-        Boolean expandTransitionUrl = expandTransitionUrlString != null ? expandTransitionUrlString == "true" : null
-        /* TODO handle urlType=content
-            A content location (without the content://). URL will be one that can access that content.
-         */
+    UrlInstance makeUrlByType(String origUrl, String urlType, MNode parameterParentNode, String expandTransitionUrlString) {
+        Boolean expandTransitionUrl = expandTransitionUrlString != null ? "true".equals(expandTransitionUrlString) : null
+        /* TODO handle urlType=content: A content location (without the content://). URL will be one that can access that content. */
         ScreenUrlInfo suInfo
         String urlTypeExpanded = ec.resource.expand(urlType, "")
         switch (urlTypeExpanded) {
@@ -1095,15 +1111,15 @@ class ScreenRenderImpl implements ScreenRender {
         UrlInstance urli = suInfo.getInstance(this, expandTransitionUrl)
 
         if (parameterParentNode != null) {
-            String parameterMapStr = (String) parameterParentNode.attribute('parameter-map')
+            String parameterMapStr = (String) parameterParentNode.attribute("parameter-map")
             if (parameterMapStr) {
-                def ctxParameterMap = ec.resource.expression(parameterMapStr, "")
-                if (ctxParameterMap) urli.addParameters((Map) ctxParameterMap)
+                Map ctxParameterMap = (Map) ec.resource.expression(parameterMapStr, "")
+                if (ctxParameterMap) urli.addParameters(ctxParameterMap)
             }
             for (MNode parameterNode in parameterParentNode.children("parameter")) {
-                String name = parameterNode.attribute('name')
+                String name = parameterNode.attribute("name")
                 urli.addParameter(name, getContextValue(
-                        parameterNode.attribute('from') ?: name, parameterNode.attribute('value')))
+                        parameterNode.attribute("from") ?: name, parameterNode.attribute("value")))
             }
         }
 
@@ -1119,23 +1135,21 @@ class ScreenRenderImpl implements ScreenRender {
             return ""
         }
     }
-    String setInContext(FtlNodeWrapper setNodeWrapper) {
-        MNode setNode = setNodeWrapper.getMNode()
-        ((ResourceFacadeImpl) ec.resource).setInContext(setNode.attribute('field'),
-                setNode.attribute('from'), setNode.attribute('value'),
-                setNode.attribute('default-value'), setNode.attribute('type'),
-                setNode.attribute('set-if-empty'))
+    String setInContext(MNode setNode) {
+        ((ResourceFacadeImpl) ec.resource).setInContext(setNode.attribute("field"),
+                setNode.attribute("from"), setNode.attribute("value"),
+                setNode.attribute("default-value"), setNode.attribute("type"),
+                setNode.attribute("set-if-empty"))
         return ""
     }
     String pushContext() { ec.getContext().push(); return "" }
     String popContext() { ec.getContext().pop(); return "" }
 
     /** Call this at the beginning of a form-single. Always call popContext() at the end of the form! */
-    String pushSingleFormMapContext(FtlNodeWrapper formNodeWrapper) {
+    String pushSingleFormMapContext(MNode formNode) {
         ContextStack cs = ec.getContext()
-        MNode formNode = formNodeWrapper.getMNode()
-        String mapName = formNode.attribute('map') ?: "fieldValues"
-        Map valueMap = (Map) cs.get(mapName)
+        String mapName = formNode.attribute("map") ?: "fieldValues"
+        Map valueMap = (Map) cs.getByString(mapName)
 
         cs.push()
         if (valueMap) cs.putAll(valueMap)
@@ -1144,35 +1158,102 @@ class ScreenRenderImpl implements ScreenRender {
 
         return ""
     }
-    String getFieldValueString(FtlNodeWrapper fieldNodeWrapper, String defaultValue, String format) {
-        Object obj = getFieldValue(fieldNodeWrapper, defaultValue)
-        String strValue = ec.l10n.format(obj, format)
-        return strValue
+    String startFormListRow(ScreenForm.FormListRenderInfo listRenderInfo, Object listEntry, int index, boolean hasNext) {
+        ec.contextStack.push()
+
+        if (listEntry instanceof Map) {
+            ec.contextStack.putAll((Map) listEntry)
+        } else {
+            throw new IllegalArgumentException("Found form-list ${listRenderInfo.getFormNode().attribute('name')} list entry that is not a Map, is a ${listEntry.class.name} which should never happen after running list through list pre-processor")
+        }
+        // NOTE: this returns an empty String so that it can be used in an FTL interpolation, but nothing is written
+        return ""
     }
-    String getFieldValuePlainString(FtlNodeWrapper fieldNodeWrapper, String defaultValue) {
-        // NOTE: defaultValue is handled below so that for a plain string it is not run through expand
-        Object obj = getFieldValue(fieldNodeWrapper, "")
-        if (!obj && defaultValue) return ec.getResource().expand(defaultValue, "")
-        return StupidUtilities.toPlainString(obj)
-        // NOTE: this approach causes problems with currency fields, but kills the string expand for default-value... a better approach?
-        //return obj ? obj.toString() : (defaultValue ? ec.getResource().expand(defaultValue, null) : "")
+    String endFormListRow() {
+        ec.contextStack.pop()
+        // NOTE: this returns an empty String so that it can be used in an FTL interpolation, but nothing is written
+        return ""
+    }
+    String startFormListSubRow(ScreenForm.FormListRenderInfo listRenderInfo, Object subListEntry, int index, boolean hasNext) {
+        ec.contextStack.push()
+        MNode formNode = listRenderInfo.formNode
+        if (subListEntry instanceof Map) {
+            ec.contextStack.putAll((Map) subListEntry)
+        } else {
+            throw new IllegalArgumentException("Found form-list ${listRenderInfo.getFormNode().attribute('name')} sub-list entry that is not a Map, is a ${subListEntry.class.name} which should never happen after running list through list pre-processor")
+        }
+        String listStr = formNode.attribute('list')
+        ec.contextStack.put(listStr + "_sub_index", index)
+        ec.contextStack.put(listStr + "_sub_has_next", hasNext)
+        ec.contextStack.put(listStr + "_sub_entry", subListEntry)
+        // NOTE: this returns an empty String so that it can be used in an FTL interpolation, but nothing is written
+        return ""
+    }
+    String endFormListSubRow() {
+        ec.contextStack.pop()
+        // NOTE: this returns an empty String so that it can be used in an FTL interpolation, but nothing is written
+        return ""
+    }
+    static String safeCloseList(Object listObject) {
+        if (listObject instanceof EntityListIterator) ((EntityListIterator) listObject).close()
+        // NOTE: this returns an empty String so that it can be used in an FTL interpolation, but nothing is written
+        return ""
     }
 
-    Object getFieldValue(FtlNodeWrapper fieldNodeWrapper, String defaultValue) {
-        MNode fieldNode = fieldNodeWrapper.getMNode()
-        String entryName = fieldNode.attribute('entry-name')
-        if (entryName) return ec.getResource().expression(entryName, null)
-        String fieldName = fieldNode.attribute('name')
-        String mapName = fieldNode.parent.attribute('map') ?: "fieldValues"
+    String getFieldValueString(MNode widgetNode) {
+        MNode fieldNodeWrapper = widgetNode.parent.parent
+        String defaultValue = widgetNode.attribute("default-value")
+        if (defaultValue == null) defaultValue = ""
+        String format = widgetNode.attribute("format")
+        if ("text".equals(renderMode) || "csv".equals(renderMode)) {
+            String textFormat = widgetNode.attribute("text-format")
+            if (textFormat != null && !textFormat.isEmpty()) format = textFormat
+        }
+
+        Object obj = getFieldValue(fieldNodeWrapper, defaultValue)
+        if (obj == null) return ""
+        if (obj instanceof String) return (String) obj
+        String strValue = ec.l10nFacade.format(obj, format)
+        return strValue
+    }
+    String getFieldValueString(MNode fieldNodeWrapper, String defaultValue, String format) {
+        Object obj = getFieldValue(fieldNodeWrapper, defaultValue)
+        if (obj == null) return ""
+        if (obj instanceof String) return (String) obj
+        String strValue = ec.l10nFacade.format(obj, format)
+        return strValue
+    }
+    String getFieldValuePlainString(MNode fieldNodeWrapper, String defaultValue) {
+        // NOTE: defaultValue is handled below so that for a plain string it is not run through expand
+        Object obj = getFieldValue(fieldNodeWrapper, "")
+        if (ObjectUtilities.isEmpty(obj) && defaultValue != null && defaultValue.length() > 0)
+            return ec.resourceFacade.expandNoL10n(defaultValue, "")
+        return ObjectUtilities.toPlainString(obj)
+    }
+
+    Object getFieldValue(MNode fieldNode, String defaultValue) {
+        String fieldName = fieldNode.attribute("name")
         Object value = null
-        // if this is an error situation try parameters first, otherwise try parameters last
-        Map<String, Object> errorParameters = ec.getWeb()?.getErrorParameters()
-        if (errorParameters != null && (errorParameters.moquiFormName == fieldNode.parent.attribute('name')))
-            value = errorParameters.get(fieldName)
-        Map valueMap = (Map) ec.resource.expression(mapName, "")
-        if (StupidUtilities.isEmpty(value)) {
-            MNode formNode = fieldNode.parent
-            if (valueMap && formNode.name == "form-single") {
+
+        MNode formNode = fieldNode.parent
+        if ("form-single".equals(formNode.name)) {
+            // if this is an error situation try error parameters first
+            Map<String, Object> errorParameters = ec.getWeb()?.getErrorParameters()
+            if (errorParameters != null && (errorParameters.moquiFormName == fieldNode.parent.attribute("name"))) {
+                value = errorParameters.get(fieldName)
+                if (!ObjectUtilities.isEmpty(value)) return value
+            }
+
+            // NOTE: field.@from attribute is handled for form-list in pre-processing done by AggregationUtil
+            String fromAttr = fieldNode.attribute("from")
+            if (fromAttr == null || fromAttr.isEmpty()) fromAttr = fieldNode.attribute("entry-name")
+            if (fromAttr != null && fromAttr.length() > 0) return ec.resourceFacade.expression(fromAttr, null)
+
+            String mapAttr = formNode.attribute("map")
+            String mapName = mapAttr != null && mapAttr.length() > 0 ? mapAttr : "fieldValues"
+            Map valueMap = (Map) ec.resource.expression(mapName, "")
+
+            if (valueMap != null) {
                 try {
                     if (valueMap instanceof EntityValueBase) {
                         // if it is an EntityValueImpl, only get if the fieldName is a value
@@ -1183,80 +1264,47 @@ class ScreenRenderImpl implements ScreenRender {
                     }
                 } catch (EntityException e) {
                     // do nothing, not necessarily an entity field
-                    if (logger.isTraceEnabled()) logger.trace("Ignoring entity exception for non-field: ${e.toString()}")
-                }
-            } else if (formNode.name == "form-list" && formNode.attribute('list-entry')) {
-                // use some Groovy goodness to get an object property, only do if this is NOT a Map (that is handled by
-                //     putting all Map entries in the context for each row)
-                Object entryObj = ec.getContext().get(formNode.attribute('list-entry'))
-                if (entryObj != null && !(entryObj instanceof Map)) {
-                    try {
-                        value = entryObj.getAt(fieldName)
-                    } catch (MissingPropertyException e) {
-                        // ignore exception, we know this may not be a real property of the object
-                    }
+                    if (isTraceEnabled) logger.trace("Ignoring entity exception for non-field: ${e.toString()}")
                 }
             }
         }
-        if (StupidUtilities.isEmpty(value)) value = ec.getContext().get(fieldName)
-        // this isn't needed since the parameters are copied to the context: if (!isError && isWebAndSameForm && !value) value = ec.getWeb().parameters.get(fieldName)
 
-        if (!StupidUtilities.isEmpty(value)) return value
+        // the value == null check here isn't necessary but is the most common case so
+        if (value == null || ObjectUtilities.isEmpty(value)) {
+            value = ec.contextStack.getByString(fieldName)
+            if (!ObjectUtilities.isEmpty(value)) return value
+        } else {
+            return value
+        }
 
         String defaultStr = ec.getResource().expand(defaultValue, null)
-        if (defaultStr) return defaultStr
+        if (defaultStr != null && defaultStr.length() > 0) return defaultStr
         return value
     }
-    String getFieldValueClass(FtlNodeWrapper fieldNodeWrapper) {
-        Object fieldValue = null
-
-        MNode fieldNode = fieldNodeWrapper.getMNode()
-        String entryName = fieldNode.attribute('entry-name')
-        if (entryName) fieldValue = ec.getResource().expression(entryName, null)
-        if (fieldValue == null) {
-            String fieldName = fieldNode.attribute('name')
-            String mapName = fieldNode.parent.attribute('map') ?: "fieldValues"
-            if (ec.getContext().get(mapName) && fieldNode.parent.name == "form-single") {
-                try {
-                    Map valueMap = (Map) ec.getContext().get(mapName)
-                    if (valueMap instanceof EntityValueImpl) {
-                        // if it is an EntityValueImpl, only get if the fieldName is a value
-                        EntityValueImpl evi = (EntityValueImpl) valueMap
-                        if (evi.getEntityDefinition().isField(fieldName)) fieldValue = evi.get(fieldName)
-                    } else {
-                        fieldValue = valueMap.get(fieldName)
-                    }
-                } catch (EntityException e) {
-                    // do nothing, not necessarily an entity field
-                    if (logger.isTraceEnabled()) logger.trace("Ignoring entity exception for non-field: ${e.toString()}")
-                }
-            }
-            if (!fieldValue) fieldValue = ec.getContext().get(fieldName)
-        }
-
+    String getFieldValueClass(MNode fieldNodeWrapper) {
+        Object fieldValue = getFieldValue(fieldNodeWrapper, null)
         return fieldValue != null ? fieldValue.getClass().getSimpleName() : "String"
     }
 
-    String getFieldEntityValue(FtlNodeWrapper widgetNodeWrapper) {
-        FtlNodeWrapper fieldNodeWrapper = (FtlNodeWrapper) widgetNodeWrapper.parentNode.parentNode
-        Object fieldValue = getFieldValue(fieldNodeWrapper, "")
-        if (!fieldValue) return ""
-        MNode widgetNode = widgetNodeWrapper.getMNode()
-        String entityName = widgetNode.attribute('entity-name')
+    String getFieldEntityValue(MNode widgetNode) {
+        MNode fieldNode = widgetNode.parent.parent
+        Object fieldValue = getFieldValue(fieldNode, "")
+        if (fieldValue == null) return getDefaultText(widgetNode)
+        String entityName = widgetNode.attribute("entity-name")
         EntityDefinition ed = sfi.ecfi.entityFacade.getEntityDefinition(entityName)
 
         // find the entity value
-        String keyFieldName = (String) widgetNode.attribute('key-field-name')
-        if (!keyFieldName) keyFieldName = (String) widgetNode.attribute('entity-key-name')
-        if (!keyFieldName) keyFieldName = ed.getPkFieldNames().get(0)
-        String useCache = widgetNode.attribute('use-cache') ?: widgetNode.attribute('entity-use-cache') ?: 'true'
+        String keyFieldName = widgetNode.attribute("key-field-name")
+        if (keyFieldName == null || keyFieldName.isEmpty()) keyFieldName = widgetNode.attribute("entity-key-name")
+        if (keyFieldName == null || keyFieldName.isEmpty()) keyFieldName = ed.getPkFieldNames().get(0)
+        String useCache = widgetNode.attribute("use-cache") ?: widgetNode.attribute("entity-use-cache") ?: "true"
         EntityValue ev = ec.entity.find(entityName).condition(keyFieldName, fieldValue)
                 .useCache(useCache == "true").one()
-        if (ev == null) return ""
+        if (ev == null) return getDefaultText(widgetNode)
 
         String value = ""
-        String text = (String) widgetNode.attribute('text')
-        if (text) {
+        String text = (String) widgetNode.attribute("text")
+        if (text != null && text.length() > 0) {
             // push onto the context and then expand the text
             ec.context.push(ev.getMap())
             try {
@@ -1271,9 +1319,17 @@ class ScreenRenderImpl implements ScreenRender {
         }
         return value
     }
+    protected String getDefaultText(MNode widgetNode) {
+        String defaultText = widgetNode.attribute("default-text")
+        if (defaultText != null && defaultText.length() > 0) {
+            return ec.resource.expand(defaultText, null)
+        } else {
+            return ""
+        }
+    }
 
-    ListOrderedMap getFieldOptions(FtlNodeWrapper widgetNodeWrapper) {
-        return ScreenForm.getFieldOptions(widgetNodeWrapper.getMNode(), ec)
+    LinkedHashMap<String, String> getFieldOptions(MNode widgetNode) {
+        return ScreenForm.getFieldOptions(widgetNode, ec)
     }
 
     boolean isInCurrentScreenPath(List<String> pathNameList) {
@@ -1292,6 +1348,12 @@ class ScreenRenderImpl implements ScreenRender {
         }
         return false
     }
+    boolean isAnchorLink(MNode linkNode, UrlInstance urlInstance) {
+        String linkType = linkNode.attribute("link-type")
+        String urlType = linkNode.attribute("url-type")
+        return ("anchor".equals(linkType) || "anchor-button".equals(linkType)) || ((!linkType || "auto".equals(linkType)) &&
+                ((urlType && !urlType.equals("transition")) || (urlInstance.isReadOnly())))
+    }
 
     UrlInstance getCurrentScreenUrl() { return screenUrlInstance }
     URI getBaseLinkUri() {
@@ -1305,57 +1367,155 @@ class ScreenRenderImpl implements ScreenRender {
     }
 
     String getCurrentThemeId() {
+        if (curThemeId != null) return curThemeId
+
         String stteId = null
         // loop through entire screenRenderDefList and look for @screen-theme-type-enum-id, use last one found
-        if (screenUrlInfo.screenRenderDefList) for (ScreenDefinition sd in screenUrlInfo.screenRenderDefList) {
-            String stteiStr = (String) sd.screenNode?.attribute('screen-theme-type-enum-id')
-            if (stteiStr) stteId = stteiStr
-        }
-        // if no setting default to STT_INTERNAL
-        if (!stteId) stteId = "STT_INTERNAL"
-
-        // see if there is a user setting for the theme
-        String themeId = sfi.ecfi.entityFacade.find("moqui.security.UserScreenTheme")
-                .condition([userId:ec.user.userId, screenThemeTypeEnumId:stteId] as Map<String, Object>)
-                .useCache(true).disableAuthz().one()?.screenThemeId
-        // use the Enumeration.enumCode from the type to find the theme type's default screenThemeId
-        if (!themeId) {
-            boolean alreadyDisabled = ec.getArtifactExecution().disableAuthz()
-            try {
-                EntityValue themeTypeEnum = sfi.ecfi.entityFacade.find("moqui.basic.Enumeration")
-                        .condition("enumId", stteId).useCache(true).disableAuthz().one()
-                if (themeTypeEnum?.enumCode) themeId = themeTypeEnum.enumCode
-            } finally {
-                if (!alreadyDisabled) ec.getArtifactExecution().enableAuthz()
+        ArrayList<ScreenDefinition> screenRenderDefList = screenUrlInfo.screenRenderDefList
+        if (screenRenderDefList != null) {
+            int screenRenderDefListSize = screenRenderDefList.size()
+            for (int i = 0; i < screenRenderDefListSize; i++) {
+                ScreenDefinition sd = (ScreenDefinition) screenRenderDefList.get(i)
+                String stteiStr = sd.screenNode.attribute("screen-theme-type-enum-id")
+                if (stteiStr != null && stteiStr.length() > 0) stteId = stteiStr
             }
         }
+        // if no setting default to STT_INTERNAL
+        if (stteId == null) stteId = "STT_INTERNAL"
+
+        EntityFacadeImpl entityFacade = sfi.ecfi.entityFacade
+        // see if there is a user setting for the theme
+        String themeId = entityFacade.fastFindOne("moqui.security.UserScreenTheme", true, true, ec.userFacade.userId, stteId)?.screenThemeId
+        // use the Enumeration.enumCode from the type to find the theme type's default screenThemeId
+        if (themeId == null || themeId.length() == 0) {
+            EntityValue themeTypeEnum = entityFacade.fastFindOne("moqui.basic.Enumeration", true, true, stteId)
+            if (themeTypeEnum?.enumCode) themeId = themeTypeEnum.enumCode
+        }
         // theme with "DEFAULT" in the ID
-        if (!themeId) {
+        if (themeId == null || themeId.length() == 0) {
             EntityValue stv = sfi.ecfi.entityFacade.find("moqui.screen.ScreenTheme")
                     .condition("screenThemeTypeEnumId", stteId)
                     .condition("screenThemeId", ComparisonOperator.LIKE, "%DEFAULT%").one()
             if (stv) themeId = stv.screenThemeId
         }
+
+        curThemeId = themeId ?: ""
         return themeId
     }
 
-    List<String> getThemeValues(String resourceTypeEnumId) {
+    ArrayList<String> getThemeValues(String resourceTypeEnumId) {
+        ArrayList<String> cachedList = (ArrayList<String>) curThemeValuesByType.get(resourceTypeEnumId)
+        if (cachedList != null) return cachedList
+
         EntityList strList = sfi.ecfi.entityFacade.find("moqui.screen.ScreenThemeResource")
-                .condition([screenThemeId:getCurrentThemeId(), resourceTypeEnumId:resourceTypeEnumId] as Map<String, Object>)
+                .condition("screenThemeId", getCurrentThemeId()).condition("resourceTypeEnumId", resourceTypeEnumId)
                 .orderBy("sequenceNum").useCache(true).disableAuthz().list()
-        List<String> values = new LinkedList()
-        for (EntityValue str in strList) values.add(str.resourceValue as String)
+        int strListSize = strList.size()
+        ArrayList<String> values = new ArrayList<>(strListSize)
+        for (int i = 0; i < strListSize; i++) {
+            EntityValue str = (EntityValue) strList.get(i)
+            String resourceValue = (String) str.getNoCheckSimple("resourceValue")
+            if (resourceValue != null && !resourceValue.isEmpty()) values.add(resourceValue)
+        }
+
+        curThemeValuesByType.put(resourceTypeEnumId, values)
         return values
     }
-
+    // NOTE: this is called a LOT during screen renders, for links/buttons/etc
     String getThemeIconClass(String text) {
-        EntityList stiList = sfi.ecfi.entityFacade.find("moqui.screen.ScreenThemeIcon").disableAuthz()
-                .condition([screenThemeId:getCurrentThemeId()] as Map<String, Object>).useCache(true).list()
-        for (EntityValue sti in stiList) {
-            if (text.matches((String) sti.textPattern)) {
-                return (String) sti.iconClass
+        String screenThemeId = getCurrentThemeId()
+        Map<String, String> curThemeIconByText = sfi.getThemeIconByText(screenThemeId)
+        if (curThemeIconByText.containsKey(text)) return curThemeIconByText.get(text)
+
+        EntityList stiList = sfi.ecfi.entityFacade.find("moqui.screen.ScreenThemeIcon")
+                .condition("screenThemeId", screenThemeId).useCache(true).disableAuthz().list()
+        int stiListSize = stiList.size()
+        String iconClass = (String) null
+        for (int i = 0; i < stiListSize; i++) {
+            EntityValue sti = (EntityValue) stiList.get(i)
+            if (text.matches(sti.getString("textPattern"))) {
+                iconClass = sti.getString("iconClass")
+                break
             }
         }
-        return null
+
+        curThemeIconByText.put(text, iconClass)
+        return iconClass
+    }
+
+    List<Map> getMenuData(ArrayList<String> pathNameList) {
+        if (!ec.user.userId) { ec.web.response.sendError(401, "Authentication required"); return null }
+        ScreenUrlInfo fullUrlInfo = ScreenUrlInfo.getScreenUrlInfo(this, rootScreenDef, pathNameList, null, 0)
+        if (!fullUrlInfo.targetExists) { ec.web.response.sendError(404, "Screen not found for path ${pathNameList}"); return null }
+        UrlInstance fullUrlInstance = fullUrlInfo.getInstance(this, null)
+        if (!fullUrlInstance.isPermitted()) { ec.web.response.sendError(403, "View not permitted for path ${pathNameList}"); return null }
+
+        ArrayList<String> extraPath = fullUrlInfo.fullPathNameList
+        int extraPathSize = extraPath.size()
+
+        StringBuilder currentPath = new StringBuilder()
+        List<Map> menuDataList = new LinkedList<>()
+        ScreenDefinition curScreen = rootScreenDef
+
+        for (int i = 0; i < (extraPathSize - 1); i++) {
+            String pathItem = (String) extraPath.get(i)
+            String nextItem = (String) extraPath.get(i+1)
+            currentPath.append('/').append(pathItem)
+
+            SubscreensItem curSsi = curScreen.getSubscreensItem(pathItem)
+            // already checked for exists above, path may have extra path elements beyond the screen so allow it
+            if (curSsi == null) break;
+            curScreen = ec.screenFacade.getScreenDefinition(curSsi.location)
+
+            List<Map> subscreensList = new LinkedList<>()
+            ArrayList<SubscreensItem> menuItems = curScreen.getMenuSubscreensItems()
+            int menuItemsSize = menuItems.size()
+            for (int j = 0; j < menuItemsSize; j++) {
+                SubscreensItem subscreensItem = (SubscreensItem) menuItems.get(j)
+                String screenPath = new StringBuilder(currentPath).append('/').append(subscreensItem.name).toString()
+                UrlInstance screenUrlInstance = buildUrl(screenPath)
+                if (!screenUrlInstance.isPermitted()) continue
+
+                String pathWithParams = screenPath
+                ScreenDefinition screenDef = screenUrlInstance.sui.targetScreen
+                if (screenDef.hasRequired) {
+                    Map<String, String> parmMap = screenUrlInstance.getParameterMap()
+                    boolean parmMissing = false
+                    for (ScreenDefinition.ParameterItem pi in screenDef.getParameterMap().values()) {
+                        String parmValue = parmMap.get(pi.name)
+                        if (parmValue == null || parmValue.isEmpty()) { parmMissing = true; break }
+                    }
+                    if (parmMissing) continue
+                    pathWithParams += '?' + screenUrlInstance.getParameterString()
+                }
+
+                String image = screenUrlInstance.sui.menuImage
+                String imageType = screenUrlInstance.sui.menuImageType
+                if (image != null && image.length() > 0 && (imageType == null || imageType.length() == 0 || "url-screen".equals(imageType)))
+                    image = buildUrl(image).url
+
+                subscreensList.add([name:subscreensItem.name, title:ec.resource.expand(subscreensItem.menuTitle, ""),
+                                    path:screenPath, pathWithParams:pathWithParams, image:image, imageType:imageType,
+                                    active:(nextItem == subscreensItem.name), disableLink:screenUrlInstance.disableLink])
+            }
+
+            menuDataList.add([name:pathItem, title:curScreen.getDefaultMenuName(), subscreens:subscreensList,
+                              path:currentPath.toString(), hasTabMenu:curScreen.hasTabMenu()])
+        }
+
+        String lastPathItem = (String) extraPath.get(extraPathSize - 1)
+        fullUrlInstance.addParameters(ec.web.getRequestParameters())
+        currentPath.append('/').append(lastPathItem)
+        String lastPath = currentPath.toString()
+        String paramString = fullUrlInstance.getParameterString()
+        if (paramString.length() > 0) currentPath.append('?').append(paramString)
+        String lastImage = fullUrlInfo.menuImage
+        String lastImageType = fullUrlInfo.menuImageType
+        if (lastImage != null && lastImage.length() > 0 && (lastImageType == null || lastImageType.length() == 0 || "url-screen".equals(lastImageType)))
+            lastImage = buildUrl(lastImage).url
+        menuDataList.add([name:lastPathItem, title:fullUrlInfo.targetScreen.getDefaultMenuName(), path:lastPath,
+                          pathWithParams:currentPath.toString(), image:lastImage, imageType:lastImageType])
+
+        return menuDataList
     }
 }

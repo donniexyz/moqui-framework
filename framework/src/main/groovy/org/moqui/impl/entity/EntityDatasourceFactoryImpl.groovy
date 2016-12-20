@@ -14,7 +14,6 @@
 package org.moqui.impl.entity
 
 import groovy.transform.CompileStatic
-import org.h2.tools.Server
 import org.moqui.context.TransactionInternal
 import org.moqui.entity.*
 import org.moqui.util.MNode
@@ -29,30 +28,27 @@ import javax.sql.DataSource
 @CompileStatic
 class EntityDatasourceFactoryImpl implements EntityDatasourceFactory {
     protected final static Logger logger = LoggerFactory.getLogger(EntityDatasourceFactoryImpl.class)
+    protected final static int DS_RETRY_COUNT = 5
+    protected final static long DS_RETRY_SLEEP = 5000
 
-    protected EntityFacadeImpl efi
-    protected MNode datasourceNode
-    protected String tenantId
+    protected EntityFacadeImpl efi = null
+    protected MNode datasourceNode = null
 
-    protected DataSource dataSource
+    protected DataSource dataSource = null
+    EntityFacadeImpl.DatasourceInfo dsi = null
 
-    // for the embedded H2 server to allow remote access, used to stop server on destroy
-    protected Server h2Server = null
 
     EntityDatasourceFactoryImpl() { }
 
     @Override
-    EntityDatasourceFactory init(EntityFacade ef, MNode datasourceNode, String tenantId) {
+    EntityDatasourceFactory init(EntityFacade ef, MNode datasourceNode) {
         // local fields
         this.efi = (EntityFacadeImpl) ef
         this.datasourceNode = datasourceNode
-        this.tenantId = tenantId
 
         // init the DataSource
-
-        if (datasourceNode.hasChild("jndi-jdbc")) {
-            EntityFacadeImpl.DatasourceInfo dsi = new EntityFacadeImpl.DatasourceInfo(efi, datasourceNode)
-
+        dsi = new EntityFacadeImpl.DatasourceInfo(efi, datasourceNode)
+        if (dsi.jndiName != null && !dsi.jndiName.isEmpty()) {
             try {
                 InitialContext ic;
                 if (dsi.serverJndi) {
@@ -74,30 +70,32 @@ class EntityDatasourceFactoryImpl implements EntityDatasourceFactory {
             } catch (NamingException ne) {
                 logger.error("Error finding DataSource with name [${dsi.jndiName}] in JNDI server [${dsi.serverJndi ? dsi.serverJndi.attribute("context-provider-url") : "default"}] for datasource with group-name [${datasourceNode.attribute("group-name")}].", ne)
             }
-        } else if (datasourceNode.hasChild("inline-jdbc")) {
+        } else if (dsi.inlineJdbc != null) {
             // special thing for embedded derby, just set an system property; for derby.log, etc
-            if (datasourceNode.attribute("database-conf-name") == "derby") {
-                System.setProperty("derby.system.home", System.getProperty("moqui.runtime") + "/db/derby")
+            if (datasourceNode.attribute("database-conf-name") == "derby" && !System.getProperty("derby.system.home")) {
+                System.setProperty("derby.system.home", efi.ecfi.runtimePath + "/db/derby")
                 logger.info("Set property derby.system.home to [${System.getProperty("derby.system.home")}]")
             }
-            if (datasourceNode.attribute("database-conf-name") == "h2" && datasourceNode.attribute("start-server-args")) {
-                String argsString = datasourceNode.attribute("start-server-args")
-                String[] args = argsString.split(" ")
-                for (int i = 0; i < args.length; i++) {
-                    if (args[i].contains('${moqui.runtime}')) args[i] = args[i].replace('${moqui.runtime}', System.getProperty("moqui.runtime"))
-                }
+
+            TransactionInternal ti = efi.ecfi.transactionFacade.getTransactionInternal()
+            // init the DataSource, if it fails for any reason retry a few times
+            for (int retry = 1; retry <= DS_RETRY_COUNT; retry++) {
                 try {
-                    h2Server = Server.createTcpServer(args).start();
-                    logger.info("Started H2 remote server on port ${h2Server.getPort()} status [${h2Server.getStatus()}] from args ${args}")
+                    this.dataSource = ti.getDataSource(efi, datasourceNode)
+                    break
                 } catch (Throwable t) {
-                    logger.warn("Error starting H2 server (may already be running): ${t.toString()}")
+                    if (retry < DS_RETRY_COUNT) {
+                        Throwable cause = t
+                        while (cause.getCause() != null) cause = cause.getCause()
+                        logger.error("Error connecting to DataSource ${datasourceNode.attribute("group-name")} (${datasourceNode.attribute("database-conf-name")}), try ${retry} of ${DS_RETRY_COUNT}: ${cause}")
+                        sleep(DS_RETRY_SLEEP)
+                    } else {
+                        throw t
+                    }
                 }
             }
-
-            TransactionInternal ti = efi.getEcfi().getTransactionFacade().getTransactionInternal()
-            this.dataSource = ti.getDataSource(efi, datasourceNode, tenantId)
         } else {
-            throw new EntityException("Found datasource with no jdbc sub-element (in datasource with group-name [${datasourceNode.attribute("group-name")}])")
+            throw new EntityException("Found datasource with no jdbc sub-element (in datasource with group-name ${datasourceNode.attribute("group-name")})")
         }
 
         return this
@@ -106,11 +104,26 @@ class EntityDatasourceFactoryImpl implements EntityDatasourceFactory {
     @Override
     void destroy() {
         // NOTE: TransactionInternal DataSource will be destroyed when the TransactionFacade is destroyed
-        if (h2Server != null && h2Server.isRunning(true)) h2Server.stop()
     }
 
     @Override
-    void checkAndAddTable(String entityName) { efi.getEntityDbMeta().checkTableStartup(efi.getEntityDefinition(entityName)) }
+    boolean checkTableExists(String entityName) {
+        EntityDefinition ed
+        // just ignore EntityException on getEntityDefinition
+        try { ed = efi.getEntityDefinition(entityName) } catch (EntityException e) { return false }
+        // may happen if all entity names includes a DB view entity or other that doesn't really exist
+        if (ed == null) return false
+        return ed.tableExistsDbMetaOnly()
+    }
+    @Override
+    void checkAndAddTable(String entityName) {
+        EntityDefinition ed
+        // just ignore EntityException on getEntityDefinition
+        try { ed = efi.getEntityDefinition(entityName) } catch (EntityException e) { return }
+        // may happen if all entity names includes a DB view entity or other that doesn't really exist
+        if (ed == null) return
+        efi.getEntityDbMeta().checkTableStartup(ed)
+    }
 
     @Override
     EntityValue makeEntityValue(String entityName) {

@@ -13,20 +13,26 @@
  */
 package org.moqui.impl.context.renderer
 
-import org.markdown4j.Markdown4jProcessor
-import org.moqui.context.Cache
 import org.moqui.context.ExecutionContextFactory
+import org.moqui.resource.ResourceReference
 import org.moqui.context.TemplateRenderer
 import org.moqui.impl.context.ExecutionContextFactoryImpl
-import org.moqui.impl.screen.ScreenRenderImpl
+import org.moqui.jcache.MCache
+import org.pegdown.Extensions
+import org.pegdown.PegDownProcessor
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
+
+import javax.cache.Cache
 
 class MarkdownTemplateRenderer implements TemplateRenderer {
     protected final static Logger logger = LoggerFactory.getLogger(MarkdownTemplateRenderer.class)
 
+    // ALL_WITH_OPTIONALS includes SMARTS and QUOTES so XOR them to remove them
+    final static int pegDownOptions = Extensions.ALL_WITH_OPTIONALS ^ Extensions.SMARTS ^ Extensions.QUOTES
+
     protected ExecutionContextFactoryImpl ecfi
-    protected Cache templateMarkdownLocationCache
+    protected Cache<String, String> templateMarkdownLocationCache
 
     MarkdownTemplateRenderer() { }
 
@@ -37,7 +43,17 @@ class MarkdownTemplateRenderer implements TemplateRenderer {
     }
 
     void render(String location, Writer writer) {
-        String mdText = templateMarkdownLocationCache.get(location)
+        String mdText;
+        if (templateMarkdownLocationCache instanceof MCache) {
+            MCache<String, String> mCache = (MCache) templateMarkdownLocationCache;
+            ResourceReference rr = ecfi.resourceFacade.getLocationReference(location);
+            long lastModified = rr != null ? rr.getLastModified() : 0L;
+            mdText = mCache.get(location, lastModified);
+        } else {
+            // TODO: doesn't support on the fly reloading without cache expire/clear!
+            mdText = templateMarkdownLocationCache.get(location);
+        }
+
         if (mdText) {
             writer.write(mdText)
             return
@@ -49,11 +65,16 @@ class MarkdownTemplateRenderer implements TemplateRenderer {
             return
         }
 
-        Markdown4jProcessor markdown4jProcessor = new Markdown4jProcessor()
         //ScreenRenderImpl sri = (ScreenRenderImpl) ecfi.getExecutionContext().getContext().get("sri")
         // how to set base URL? if (sri != null) builder.setBase(sri.getBaseLinkUri())
 
+        /*
+        Markdown4jProcessor markdown4jProcessor = new Markdown4jProcessor()
         mdText = markdown4jProcessor.process(sourceText)
+        */
+
+        PegDownProcessor pdp = new PegDownProcessor(pegDownOptions)
+        mdText = pdp.markdownToHtml(sourceText)
 
         if (mdText) {
             templateMarkdownLocationCache.put(location, mdText)

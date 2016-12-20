@@ -15,11 +15,10 @@ package org.moqui.impl.screen
 
 import groovy.transform.CompileStatic
 import org.codehaus.groovy.runtime.InvokerHelper
-import org.moqui.context.ExecutionContext
 import org.moqui.impl.actions.XmlAction
-import org.moqui.impl.context.ContextBinding
 import org.moqui.impl.context.ExecutionContextFactoryImpl
-import org.moqui.context.ContextStack
+import org.moqui.util.ContextStack
+import org.moqui.impl.context.ExecutionContextImpl
 import org.moqui.util.MNode
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
@@ -43,7 +42,7 @@ class ScreenSection {
 
         // prep condition attribute
         String conditionAttr = sectionNode.attribute("condition")
-        if (conditionAttr) conditionClass = new GroovyClassLoader().parseClass(conditionAttr)
+        if (conditionAttr) conditionClass = ecfi.getGroovyClassLoader().parseClass(conditionAttr)
 
         // prep condition element
         if (sectionNode.first("condition")?.first() != null) {
@@ -56,7 +55,15 @@ class ScreenSection {
             // if (location.contains("FOO")) logger.warn("====== Actions for ${location}: ${actions.writeGroovyWithLines()}")
         }
         // prep widgets
-        if (sectionNode.hasChild("widgets")) widgets = new ScreenWidgets(sectionNode.first("widgets"), location + ".widgets")
+        if (sectionNode.hasChild("widgets")) {
+            if (sectionNode.getName() == "screen") {
+                MNode widgetsNode = sectionNode.first("widgets")
+                MNode screenNode = new MNode("screen", null, null, [widgetsNode], null)
+                widgets = new ScreenWidgets(screenNode, location + ".widgets")
+            } else {
+                widgets = new ScreenWidgets(sectionNode.first("widgets"), location + ".widgets")
+            }
+        }
         // prep fail-widgets
         if (sectionNode.hasChild("fail-widgets"))
             failWidgets = new ScreenWidgets(sectionNode.first("fail-widgets"), location + ".fail-widgets")
@@ -64,10 +71,10 @@ class ScreenSection {
 
     @CompileStatic
     void render(ScreenRenderImpl sri) {
-        ContextStack cs = (ContextStack) sri.ec.context
+        ContextStack cs = sri.ec.contextStack
         if (sectionNode.name == "section-iterate") {
             // if nothing to iterate over, all done
-            Object list = sri.ec.resource.expression(sectionNode.attribute("list"), null)
+            Object list = sri.ec.resourceFacade.expression(sectionNode.attribute("list"), null)
             if (!list) {
                 if (logger.traceEnabled) logger.trace("Target list [${list}] is empty, not rendering section-iterate at [${location}]")
                 return
@@ -87,8 +94,7 @@ class ScreenSection {
                 cs.push()
                 try {
                     cs.put(sectionEntry, (entry instanceof Map.Entry ? entry.getValue() : entry))
-                    if (sectionKey && entry instanceof Map.Entry)
-                        cs.put(sectionKey, entry.getKey())
+                    if (sectionKey && entry instanceof Map.Entry) cs.put(sectionKey, entry.getKey())
 
                     cs.put("sectionEntryIndex", index)
                     cs.put(sectionEntry + "_index", index)
@@ -110,17 +116,20 @@ class ScreenSection {
     @CompileStatic
     protected void renderSingle(ScreenRenderImpl sri) {
         if (logger.traceEnabled) logger.trace("Begin rendering screen section at [${location}]")
-        ExecutionContext ec = sri.getEc()
+        ExecutionContextImpl ec = sri.ec
         boolean conditionPassed = true
-        if (condition != null) conditionPassed = condition.checkCondition(ec)
-        if (conditionPassed && conditionClass != null) {
-            Script script = InvokerHelper.createScript(conditionClass, new ContextBinding(ec.getContext()))
-            Object result = script.run()
-            conditionPassed = result as boolean
+        boolean skipActions = sri.sfi.isRenderModeSkipActions(sri.renderMode)
+        if (!skipActions) {
+            if (condition != null) conditionPassed = condition.checkCondition(ec)
+            if (conditionPassed && conditionClass != null) {
+                Script script = InvokerHelper.createScript(conditionClass, ec.getContextBinding())
+                Object result = script.run()
+                conditionPassed = result as boolean
+            }
         }
 
         if (conditionPassed) {
-            if (actions != null) actions.run(ec)
+            if (!skipActions && actions != null) actions.run(ec)
             if (widgets != null) {
                 // was there an error in the actions? don't try to render the widgets, likely to be more and more errors
                 if (ec.message.hasError()) {

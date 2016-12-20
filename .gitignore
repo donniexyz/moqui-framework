@@ -7,18 +7,14 @@ build
 /framework/dependencies
 
 # build generated files
-/moqui-*.war
-/SaveDEFAULT.zip
-/SaveTenant.zip
-/SaveTransactional.zip
-/SaveAnalytical.zip
-/SaveH2.zip
-/SaveOrientDb.zip
-/SaveElasticSearch.zip
+/moqui*.war
+/Save*.zip
 
 # runtime directory (separate repository so ignore directory entirely)
 /runtime
 /execwartmp
+/docker/runtime
+/docker/db
 
 # IntelliJ IDEA files
 .idea

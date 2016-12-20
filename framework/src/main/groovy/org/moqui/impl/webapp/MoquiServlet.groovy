@@ -16,7 +16,12 @@ package org.moqui.impl.webapp
 import groovy.transform.CompileStatic
 import org.moqui.context.ArtifactTarpitException
 import org.moqui.context.AuthenticationRequiredException
+import org.moqui.impl.context.ExecutionContextFactoryImpl
+import org.moqui.impl.context.ExecutionContextImpl
+import org.moqui.impl.screen.ScreenRenderImpl
+import org.moqui.util.MNode
 
+import javax.servlet.ServletConfig
 import javax.servlet.http.HttpServlet
 import javax.servlet.http.HttpServletResponse
 import javax.servlet.http.HttpServletRequest
@@ -24,7 +29,6 @@ import javax.servlet.ServletException
 
 import org.moqui.context.ArtifactAuthorizationException
 import org.moqui.context.ExecutionContext
-import org.moqui.context.ExecutionContextFactory
 
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
@@ -33,78 +37,76 @@ import org.slf4j.LoggerFactory
 class MoquiServlet extends HttpServlet {
     protected final static Logger logger = LoggerFactory.getLogger(MoquiServlet.class)
 
-    MoquiServlet() { super(); }
+    MoquiServlet() { super() }
 
     @Override
-    void doPost(HttpServletRequest request, HttpServletResponse response) { doScreenRequest(request, response) }
+    void init(ServletConfig config) throws ServletException {
+        super.init(config)
+        logger.info("${config.getServletName()} initialized for webapp ${config.getServletContext().getInitParameter("moqui-name")}")
+    }
 
     @Override
-    void doGet(HttpServletRequest request, HttpServletResponse response) { doScreenRequest(request, response) }
+    void service(HttpServletRequest request, HttpServletResponse response) {
+        ExecutionContextFactoryImpl ecfi = (ExecutionContextFactoryImpl) getServletContext().getAttribute("executionContextFactory")
+        String webappName = getServletContext().getInitParameter("moqui-name")
 
-    @Override
-    void doPut(HttpServletRequest request, HttpServletResponse response) { doScreenRequest(request, response) }
+        // check for and cleanly handle when executionContextFactory is not in place in ServletContext attr
+        if (ecfi == null || webappName == null) {
+            response.sendError(HttpServletResponse.SC_INTERNAL_SERVER_ERROR, "System is initializing, try again soon.")
+            return
+        }
 
-    @Override
-    void doDelete(HttpServletRequest request, HttpServletResponse response) { doScreenRequest(request, response) }
-
-    void doScreenRequest(HttpServletRequest request, HttpServletResponse response) throws ServletException, IOException {
-        ExecutionContextFactory executionContextFactory =
-                (ExecutionContextFactory) getServletContext().getAttribute("executionContextFactory")
-        String moquiWebappName = getServletContext().getInitParameter("moqui-name")
-
-        String pathInfo = request.getPathInfo()
+        if (!request.characterEncoding) request.setCharacterEncoding("UTF-8")
         long startTime = System.currentTimeMillis()
+        String pathInfo = request.getPathInfo()
 
         if (logger.traceEnabled) logger.trace("Start request to [${pathInfo}] at time [${startTime}] in session [${request.session.id}] thread [${Thread.currentThread().id}:${Thread.currentThread().name}]")
 
-        ExecutionContext ec = executionContextFactory.getExecutionContext()
-        if (!request.characterEncoding) request.setCharacterEncoding("UTF-8")
-        ec.initWebFacade(moquiWebappName, request, response)
-        ec.web.requestAttributes.put("moquiRequestStartTime", startTime)
+        ExecutionContextImpl ec = ecfi.getEci()
 
         /** NOTE to set render settings manually do something like this, but it is not necessary to set these things
          * for a web page render because if we call render(request, response) it can figure all of this out as defaults
          *
-         * ScreenRender render = ec.screen.makeRender().webappName(webappMoquiName).renderMode("html")
+         * ScreenRender render = ec.screen.makeRender().webappName(moquiWebappName).renderMode("html")
          *         .rootScreenFromHost(request.getServerName()).screenPath(pathInfo.split("/") as List)
          */
 
         try {
-            ec.screen.makeRender().render(request, response)
+            ec.initWebFacade(webappName, request, response)
+            ec.web.requestAttributes.put("moquiRequestStartTime", startTime)
+
+            ScreenRenderImpl sri = (ScreenRenderImpl) ec.screenFacade.makeRender()
+            sri.render(request, response)
         } catch (AuthenticationRequiredException e) {
             logger.warn("Web Unauthorized (no authc): " + e.message)
-            response.sendError(HttpServletResponse.SC_UNAUTHORIZED, e.message)
+            sendErrorResponse(request, response, HttpServletResponse.SC_UNAUTHORIZED, "unauthorized", e.message, e, ecfi, webappName)
         } catch (ArtifactAuthorizationException e) {
             // SC_UNAUTHORIZED 401 used when authc/login fails, use SC_FORBIDDEN 403 for authz failures
             // See ScreenRenderImpl.checkWebappSettings for authc and SC_UNAUTHORIZED handling
-            logger.warn((String) "Web Access Forbidden (no authz): " + e.message)
-            response.sendError(HttpServletResponse.SC_FORBIDDEN, e.message)
+            logger.warn("Web Access Forbidden (no authz): " + e.message)
+            sendErrorResponse(request, response, HttpServletResponse.SC_FORBIDDEN, "forbidden", e.message, e, ecfi, webappName)
+        } catch (ScreenResourceNotFoundException e) {
+            logger.warn("Web Resource Not Found: " + e.message)
+            sendErrorResponse(request, response, HttpServletResponse.SC_NOT_FOUND, "not-found", e.message, e, ecfi, webappName)
         } catch (ArtifactTarpitException e) {
-            logger.warn((String) "Web Too Many Requests (tarpit): " + e.message)
+            logger.warn("Web Too Many Requests (tarpit): " + e.message)
             if (e.getRetryAfterSeconds()) response.addIntHeader("Retry-After", e.getRetryAfterSeconds())
             // NOTE: there is no constant on HttpServletResponse for 429; see RFC 6585 for details
-            response.sendError(429, e.message)
-        } catch (ScreenResourceNotFoundException e) {
-            logger.warn((String) "Web Resource Not Found: " + e.message)
-            response.sendError(HttpServletResponse.SC_NOT_FOUND, e.message)
+            sendErrorResponse(request, response, 429, "too-many", e.message, e, ecfi, webappName)
         } catch (Throwable t) {
             if (ec.message.hasError()) {
                 String errorsString = ec.message.errorsString
                 logger.error(errorsString, t)
-                response.sendError(HttpServletResponse.SC_INTERNAL_SERVER_ERROR, errorsString)
+                sendErrorResponse(request, response, HttpServletResponse.SC_INTERNAL_SERVER_ERROR, "internal-error",
+                        errorsString, t, ecfi, webappName)
             } else {
-                throw t
+                logger.error("Internal error processing request: " + t.message, t)
+                sendErrorResponse(request, response, HttpServletResponse.SC_INTERNAL_SERVER_ERROR, "internal-error",
+                        t.message, t, ecfi, webappName)
             }
         } finally {
             // make sure everything is cleaned up
             ec.destroy()
-        }
-
-        if (logger.isInfoEnabled() || logger.isTraceEnabled()) {
-            String contentType = response.getContentType()
-            String logMsg = "Finished request to ${pathInfo} of content type ${response.getContentType()} in ${(System.currentTimeMillis()-startTime)/1000} seconds in session ${request.session.id} thread ${Thread.currentThread().id}:${Thread.currentThread().name}"
-            if (logger.isInfoEnabled() && contentType && contentType.contains("text/html")) logger.info(logMsg)
-            if (logger.isTraceEnabled()) logger.trace(logMsg)
         }
 
         /* this is here just for kicks, uncomment to log a list of all artifacts hit/used in the screen render
@@ -113,5 +115,33 @@ class MoquiServlet extends HttpServlet {
         for (def aei in ec.artifactExecution.history) hits.append("\n").append(aei)
         logger.info(hits.toString())
          */
+    }
+
+    static void sendErrorResponse(HttpServletRequest request, HttpServletResponse response, int errorCode, String errorType,
+            String message, Throwable origThrowable, ExecutionContextFactoryImpl ecfi, String moquiWebappName) {
+        if (ecfi == null) {
+            response.sendError(errorCode, message)
+            return
+        }
+        ExecutionContext ec = ecfi.getExecutionContext()
+        MNode errorScreenNode = ecfi.getWebappInfo(moquiWebappName)?.getErrorScreenNode(errorType)
+        if (errorScreenNode != null) {
+            try {
+                ec.context.put("errorCode", errorCode)
+                ec.context.put("errorType", errorType)
+                ec.context.put("errorMessage", message)
+                ec.context.put("errorThrowable", origThrowable)
+                String screenPathAttr = errorScreenNode.attribute("screen-path")
+                // don't do this, causes servlet container to return no content for error status codes: response.setStatus(errorCode)
+                ec.screen.makeRender().webappName(moquiWebappName).renderMode("html")
+                        .rootScreenFromHost(request.getServerName()).screenPath(Arrays.asList(screenPathAttr.split("/")))
+                        .render(request, response)
+            } catch (Throwable t) {
+                logger.error("Error rendering ${errorType} error screen, sending code ${errorCode} with message: ${message}", t)
+                response.sendError(errorCode, message)
+            }
+        } else {
+            response.sendError(errorCode, message)
+        }
     }
 }

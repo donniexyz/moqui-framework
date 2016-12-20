@@ -15,11 +15,12 @@ package org.moqui.impl.context.runner
 
 import groovy.transform.CompileStatic
 import org.moqui.BaseException
-import org.moqui.context.Cache
 import org.moqui.context.ExecutionContext
 import org.moqui.context.ExecutionContextFactory
 import org.moqui.context.ScriptRunner
 import org.moqui.impl.context.ExecutionContextFactoryImpl
+
+import javax.cache.Cache
 import javax.script.Bindings
 import javax.script.Compilable
 import javax.script.CompiledScript
@@ -45,7 +46,7 @@ class JavaxScriptRunner implements ScriptRunner {
 
     ScriptRunner init(ExecutionContextFactory ecf) {
         this.ecfi = (ExecutionContextFactoryImpl) ecf
-        this.scriptLocationCache = ecfi.getCacheFacade().getCache("resource.${engineName}.location")
+        this.scriptLocationCache = ecfi.cacheFacade.getCache("resource.${engineName}.location")
         return this
     }
 

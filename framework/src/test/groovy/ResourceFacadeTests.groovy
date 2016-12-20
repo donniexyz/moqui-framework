@@ -15,9 +15,8 @@
 import spock.lang.*
 
 import org.moqui.context.ExecutionContext
-import org.moqui.entity.EntityValue
 import org.moqui.Moqui
-import org.moqui.context.ResourceReference
+import org.moqui.resource.ResourceReference
 
 class ResourceFacadeTests extends Specification {
     @Shared
@@ -36,7 +35,7 @@ class ResourceFacadeTests extends Specification {
     def "get Location ResourceReference (#location)"() {
         expect:
         ResourceReference rr = ec.resource.getLocationReference(location)
-        // the resolved location is unpredictable, so don't test for that: rr.location == location
+        // the resolved location is different for some of these tests, so don't test for that: rr.location == location
         rr.uri.scheme == scheme
         rr.uri.host == host
         rr.fileName == fileName
@@ -50,10 +49,10 @@ class ResourceFacadeTests extends Specification {
         "component://tools/screen/Tools.xml" | "file" | null | "Tools.xml" | "text/xml" | true | true | false
         "component://tools/screen/ToolsFoo.xml" | "file" | null | "ToolsFoo.xml" | "text/xml" | false | false | false
         "classpath://entity/BasicEntities.xml" | "file" | null | "BasicEntities.xml" | "text/xml" | true | true | false
-        "classpath://jta.properties" | "file" | null | "jta.properties" | "text/x-java-properties" | true | true | false
+        "classpath://bitronix-default-config.properties" | "file" | null | "bitronix-default-config.properties" | "text/x-java-properties" | true | true | false
         "classpath://shiro.ini" | "file" | null | "shiro.ini" | "text/plain" | true | true | false
         "template/screen-macro/ScreenHtmlMacros.ftl" | "file" | null | "ScreenHtmlMacros.ftl" | "text/x-freemarker" | true | true | false
-        "template/screen-macro" | "file" | null | "screen-macro" | null | true | false | true
+        "template/screen-macro" | "file" | null | "screen-macro" | "application/octet-stream" | true | false | true
     }
 
     @Unroll
@@ -68,7 +67,7 @@ class ResourceFacadeTests extends Specification {
         "classpath://shiro.ini" | "org.moqui.impl.util.MoquiShiroRealm"
     }
 
-    // TODO: add tests for renderTemplateInCurrentContext and script
+    // TODO: add tests for template() and script()
 
     @Unroll
     def "groovy evaluate Condition (#expression)"() {
@@ -79,7 +78,7 @@ class ResourceFacadeTests extends Specification {
         expression | result
         "true" | true
         "false" | false
-        "ec.context instanceof org.moqui.context.ContextStack" | true
+        "ec.context instanceof org.moqui.util.ContextStack" | true
     }
 
     @Unroll
@@ -89,7 +88,7 @@ class ResourceFacadeTests extends Specification {
 
         where:
         expression | result
-        "ec.tenantId" | ec.tenantId
+        "ec.factory.moquiVersion" | ec.factory.moquiVersion
         "null" | null
         "undefinedVariable" | null
     }
@@ -101,7 +100,7 @@ class ResourceFacadeTests extends Specification {
 
         where:
         inputString | result
-        "Tenant: \${ec.tenantId}" | "Tenant: ${ec.tenantId}"
+        'Version: ${ec.factory.moquiVersion}' | "Version: ${ec.factory.moquiVersion}"
         "plain string" | "plain string"
     }
 }

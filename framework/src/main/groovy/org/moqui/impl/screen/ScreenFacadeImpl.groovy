@@ -15,17 +15,20 @@ package org.moqui.impl.screen
 
 import freemarker.template.Template
 import groovy.transform.CompileStatic
-import org.moqui.context.ResourceReference
+import org.moqui.BaseException
+import org.moqui.resource.ResourceReference
 import org.moqui.screen.ScreenFacade
 import org.moqui.screen.ScreenRender
-import org.moqui.context.Cache
 import org.moqui.impl.context.ExecutionContextFactoryImpl
 import org.moqui.impl.screen.ScreenDefinition.SubscreensItem
 import org.moqui.impl.screen.ScreenDefinition.TransitionItem
 import org.moqui.screen.ScreenTest
 import org.moqui.util.MNode
+
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
+
+import javax.cache.Cache
 
 @CompileStatic
 public class ScreenFacadeImpl implements ScreenFacade {
@@ -33,30 +36,42 @@ public class ScreenFacadeImpl implements ScreenFacade {
 
     protected final ExecutionContextFactoryImpl ecfi
 
-    protected final Cache screenLocationCache
-    protected final Cache screenLocationPermCache
+    protected final Cache<String, ScreenDefinition> screenLocationCache
+    protected final Cache<String, ScreenDefinition> screenLocationPermCache
     // used by ScreenUrlInfo
-    final Cache screenUrlCache
-    protected final Cache screenInfoCache
-    protected final Cache screenInfoRefRevCache
-    protected final Cache screenTemplateModeCache
-    protected final Cache screenTemplateLocationCache
-    protected final Cache widgetTemplateLocationCache
-    protected final Cache screenFindPathCache
-    protected final Cache dbFormNodeByIdCache
+    final Cache<String, ScreenUrlInfo> screenUrlCache
+    protected final Cache<String, List<ScreenInfo>> screenInfoCache
+    protected final Cache<String, Set<String>> screenInfoRefRevCache
+    protected final Cache<String, Template> screenTemplateModeCache
+    protected final Map<String, String> mimeTypeByRenderMode = new HashMap<>()
+    protected final Map<String, Boolean> alwaysStandaloneByRenderMode = new HashMap<>()
+    protected final Map<String, Boolean> skipActionsByRenderMode = new HashMap<>()
+    protected final Cache<String, Template> screenTemplateLocationCache
+    protected final Cache<String, MNode> widgetTemplateLocationCache
+    protected final Cache<String, ArrayList<String>> screenFindPathCache
+    protected final Cache<String, MNode> dbFormNodeByIdCache
+
+    protected final Map<String, Map<String, String>> themeIconByTextByTheme = new HashMap<>()
 
     ScreenFacadeImpl(ExecutionContextFactoryImpl ecfi) {
         this.ecfi = ecfi
-        this.screenLocationCache = ecfi.cacheFacade.getCache("screen.location")
-        this.screenLocationPermCache = ecfi.cacheFacade.getCache("screen.location.perm")
-        this.screenUrlCache = ecfi.cacheFacade.getCache("screen.url")
-        this.screenInfoCache = ecfi.cacheFacade.getCache("screen.info")
-        this.screenInfoRefRevCache = ecfi.cacheFacade.getCache("screen.info.ref.rev")
-        this.screenTemplateModeCache = ecfi.cacheFacade.getCache("screen.template.mode")
-        this.screenTemplateLocationCache = ecfi.cacheFacade.getCache("screen.template.location")
-        this.widgetTemplateLocationCache = ecfi.cacheFacade.getCache("widget.template.location")
-        this.screenFindPathCache = ecfi.cacheFacade.getCache("screen.find.path")
-        this.dbFormNodeByIdCache = ecfi.cacheFacade.getCache("screen.form.db.node")
+        screenLocationCache = ecfi.cacheFacade.getCache("screen.location", String.class, ScreenDefinition.class)
+        screenLocationPermCache = ecfi.cacheFacade.getCache("screen.location.perm", String.class, ScreenDefinition.class)
+        screenUrlCache = ecfi.cacheFacade.getCache("screen.url", String.class, ScreenUrlInfo.class)
+        screenInfoCache = ecfi.cacheFacade.getCache("screen.info", String.class, List.class)
+        screenInfoRefRevCache = ecfi.cacheFacade.getCache("screen.info.ref.rev", String.class, Set.class)
+        screenTemplateModeCache = ecfi.cacheFacade.getCache("screen.template.mode", String.class, Template.class)
+        screenTemplateLocationCache = ecfi.cacheFacade.getCache("screen.template.location", String.class, Template.class)
+        widgetTemplateLocationCache = ecfi.cacheFacade.getCache("widget.template.location", String.class, MNode.class)
+        screenFindPathCache = ecfi.cacheFacade.getCache("screen.find.path", String.class, ArrayList.class)
+        dbFormNodeByIdCache = ecfi.cacheFacade.getCache("screen.form.db.node", String.class, MNode.class)
+
+        List<MNode> stoNodes = ecfi.getConfXmlRoot().first("screen-facade").children("screen-text-output")
+        for (MNode stoNode in stoNodes) {
+            mimeTypeByRenderMode.put(stoNode.attribute("type"), stoNode.attribute("mime-type"))
+            alwaysStandaloneByRenderMode.put(stoNode.attribute("type"), stoNode.attribute("always-standalone") == "true")
+            skipActionsByRenderMode.put(stoNode.attribute("type"), stoNode.attribute("skip-actions") == "true")
+        }
     }
 
     ExecutionContextFactoryImpl getEcfi() { return ecfi }
@@ -97,42 +112,68 @@ public class ScreenFacadeImpl implements ScreenFacade {
         return allLocations
     }
 
-    @CompileStatic
     boolean isScreen(String location) {
+        if (location == null || location.length() == 0) return false
         if (!location.endsWith(".xml")) return false
         if (screenLocationCache.containsKey(location)) return true
 
         try {
-            ScreenDefinition checkSd = getScreenDefinition(location)
-            return (checkSd != null)
+            // we checked the screenLocationCache above, so now do a quick file parse to see if it is a XML file with 'screen' root
+            //     element; this is faster and more reliable when a screen is not loaded, screen doesn't have to be fully valid
+            //     which is important as with the old approach if there was an error parsing or compiling the screen it was a false
+            //     negative and the screen source would be sent in response
+            ResourceReference screenRr = ecfi.resourceFacade.getLocationReference(location)
+            MNode screenNode = MNode.parseRootOnly(screenRr)
+            return screenNode != null && "screen".equals(screenNode.getName())
+
+            // old approach
+            // ScreenDefinition checkSd = getScreenDefinition(location)
+            // return (checkSd != null)
         } catch (Throwable t) {
             // ignore the error, just checking to see if it is a screen
-            if (logger.isInfoEnabled()) logger.info("Error when checking to see if [${location}] is a XML Screen: ${t.toString()}")
+            if (logger.isInfoEnabled()) logger.info("Error when checking to see if [${location}] is a XML Screen: ${t.toString()}", t)
             return false
         }
     }
 
-    @CompileStatic
     ScreenDefinition getScreenDefinition(String location) {
-        if (!location) return null
+        if (location == null || location.length() == 0) return null
         ScreenDefinition sd = (ScreenDefinition) screenLocationCache.get(location)
-        if (sd) return sd
+        if (sd != null) return sd
 
         return makeScreenDefinition(location)
     }
 
-    @CompileStatic
     protected synchronized ScreenDefinition makeScreenDefinition(String location) {
         ScreenDefinition sd = (ScreenDefinition) screenLocationCache.get(location)
         if (sd != null) return sd
 
-        ResourceReference screenRr = ecfi.getResourceFacade().getLocationReference(location)
+        ResourceReference screenRr = ecfi.resourceFacade.getLocationReference(location)
 
         ScreenDefinition permSd = (ScreenDefinition) screenLocationPermCache.get(location)
-        if (permSd) {
+        if (permSd != null) {
             // check to see if file has been modified, if we know when it was last modified
-            if (permSd.sourceLastModified && screenRr.supportsLastModified() &&
-                    screenRr.getLastModified() == permSd.sourceLastModified) {
+            boolean modified = true
+            if (screenRr.supportsLastModified()) {
+                long rrLastModified = screenRr.getLastModified()
+                modified = permSd.screenLoadedTime < rrLastModified
+                // see if any screens it depends on (any extends, etc) have been modified
+                if (!modified) {
+                    for (String dependLocation in permSd.dependsOnScreenLocations) {
+                        ScreenDefinition dependSd = getScreenDefinition(dependLocation)
+                        if (dependSd.sourceLastModified == null) { modified = true; break; }
+                        if (dependSd.sourceLastModified > permSd.screenLoadedTime) {
+                            // logger.info("Screen ${location} depends on ${dependLocation}, modified ${dependSd.sourceLastModified} > ${permSd.screenLoadedTime}")
+                            modified = true; break;
+                        }
+                    }
+                }
+            }
+
+            if (modified) {
+                screenLocationPermCache.remove(location)
+                logger.info("Reloading modified screen ${location}")
+            } else {
                 //logger.warn("========= screen expired but hasn't changed so reusing: ${location}")
 
                 // call this just in case a new screen was added, note this does slow things down just a bit, but only in dev (not in production)
@@ -140,26 +181,21 @@ public class ScreenFacadeImpl implements ScreenFacade {
 
                 screenLocationCache.put(location, permSd)
                 return permSd
-            } else {
-                screenLocationPermCache.remove(location)
-                logger.info("Screen modified since last loaded, reloading: ${location}")
             }
         }
 
         MNode screenNode = MNode.parse(screenRr)
-        if (screenNode == null) {
-            throw new IllegalArgumentException("Cound not find definition for screen at location [${location}]")
-        }
+        if (screenNode == null) throw new IllegalArgumentException("Cound not find definition for screen location ${location}")
 
         sd = new ScreenDefinition(this, screenNode, location)
         // logger.warn("========= loaded screen [${location}] supports LM ${screenRr.supportsLastModified()}, LM: ${screenRr.getLastModified()}")
-        sd.sourceLastModified = screenRr.supportsLastModified() ? screenRr.getLastModified() : null
+        if (screenRr.supportsLastModified()) sd.sourceLastModified = screenRr.getLastModified()
         screenLocationCache.put(location, sd)
         if (screenRr.supportsLastModified()) screenLocationPermCache.put(location, sd)
         return sd
     }
 
-    @CompileStatic
+    /** NOTE: this is used in ScreenServices.xml for dynamic form stuff (FormResponse, etc) */
     MNode getFormNode(String location) {
         if (!location) return null
         if (location.contains("#")) {
@@ -170,32 +206,30 @@ public class ScreenFacadeImpl implements ScreenFacade {
             } else {
                 ScreenDefinition esd = getScreenDefinition(screenLocation)
                 ScreenForm esf = esd ? esd.getForm(formName) : null
-                return esf?.formNode
+                return esf?.getOrCreateFormNode()
             }
         } else {
             throw new IllegalArgumentException("Must use full form location (with #) to get a form node, [${location}] has no hash (#).")
         }
     }
 
-    String getMimeTypeByMode(String renderMode) {
-        MNode stoNode = ecfi.getConfXmlRoot().first("screen-facade")
-                .first({ MNode it -> it.name == "screen-text-output" && it.attribute("type") == renderMode })
-        return stoNode != null ? stoNode.attribute("mime-type") : null
-    }
+    boolean isRenderModeValid(String renderMode) { return mimeTypeByRenderMode.containsKey(renderMode) }
+    boolean isRenderModeAlwaysStandalone(String renderMode) { return alwaysStandaloneByRenderMode.get(renderMode) }
+    boolean isRenderModeSkipActions(String renderMode) { return skipActionsByRenderMode.get(renderMode) }
+    String getMimeTypeByMode(String renderMode) { return (String) mimeTypeByRenderMode.get(renderMode) }
 
-    @CompileStatic
     Template getTemplateByMode(String renderMode) {
         Template template = (Template) screenTemplateModeCache.get(renderMode)
-        if (template) return template
+        if (template != null) return template
 
         template = makeTemplateByMode(renderMode)
-        if (!template) throw new IllegalArgumentException("Could not find screen render template for mode [${renderMode}]")
+        if (template == null) throw new IllegalArgumentException("Could not find screen render template for mode [${renderMode}]")
         return template
     }
 
     protected synchronized Template makeTemplateByMode(String renderMode) {
         Template template = (Template) screenTemplateModeCache.get(renderMode)
-        if (template) return template
+        if (template != null) return template
 
         MNode stoNode = ecfi.getConfXmlRoot().first("screen-facade")
                 .first({ MNode it -> it.name == "screen-text-output" && it.attribute("type") == renderMode })
@@ -216,17 +250,15 @@ public class ScreenFacadeImpl implements ScreenFacade {
         return newTemplate
     }
 
-    @CompileStatic
     Template getTemplateByLocation(String templateLocation) {
         Template template = (Template) screenTemplateLocationCache.get(templateLocation)
-        if (template) return template
+        if (template != null) return template
         return makeTemplateByLocation(templateLocation)
     }
 
-    @CompileStatic
     protected synchronized Template makeTemplateByLocation(String templateLocation) {
         Template template = (Template) screenTemplateLocationCache.get(templateLocation)
-        if (template) return template
+        if (template != null) return template
 
         // NOTE: this is a special case where we need something to call #recurse so that all includes can be straight libraries
         String rootTemplate = """<#include "${templateLocation}"/><#visit widgetsNode>"""
@@ -246,7 +278,6 @@ public class ScreenFacadeImpl implements ScreenFacade {
         return newTemplate
     }
 
-    @CompileStatic
     MNode getWidgetTemplatesNodeByLocation(String templateLocation) {
         MNode templatesNode = (MNode) widgetTemplateLocationCache.get(templateLocation)
         if (templatesNode != null) return templatesNode
@@ -262,6 +293,32 @@ public class ScreenFacadeImpl implements ScreenFacade {
         return templatesNode
     }
 
+    Map<String, String> getThemeIconByText(String screenThemeId) {
+        Map<String, String> themeIconByText = (Map<String, String>) themeIconByTextByTheme.get(screenThemeId)
+        if (themeIconByText == null) {
+            themeIconByText = new HashMap<>()
+            themeIconByTextByTheme.put(screenThemeId, themeIconByText)
+        }
+        return themeIconByText
+    }
+    String rootScreenFromHost(String host, String webappName) {
+        ExecutionContextFactoryImpl.WebappInfo webappInfo = ecfi.getWebappInfo(webappName)
+        MNode webappNode = webappInfo.webappNode
+        MNode wildcardHost = (MNode) null
+        for (MNode rootScreenNode in webappNode.children("root-screen")) {
+            String hostAttr = rootScreenNode.attribute("host")
+            if (".*".equals(hostAttr)) {
+                // remember wildcard host, default to it if no other matches (just in case put earlier in the list than others)
+                wildcardHost = rootScreenNode
+            } else if (host.matches(hostAttr)) {
+                return rootScreenNode.attribute("location")
+            }
+        }
+        if (wildcardHost != null) return wildcardHost.attribute("location")
+        throw new BaseException("Could not find root screen for host: ${host}")
+    }
+
+    /** Called from ArtifactStats screen */
     List<ScreenInfo> getScreenInfoList(String rootLocation, int levels) {
         ScreenInfo rootInfo = new ScreenInfo(getScreenDefinition(rootLocation), null, null, 0)
         List<ScreenInfo> infoList = []
@@ -279,7 +336,7 @@ public class ScreenFacadeImpl implements ScreenFacade {
         Map<String, TransitionInfo> transitionInfoByName = new TreeMap()
         int level
         String name
-        List<String> screenPath = []
+        ArrayList<String> screenPath = new ArrayList<>()
 
         boolean isNonPlaceholder = false
         int subscreens = 0, allSubscreens = 0, subscreensNonPlaceholder = 0, allSubscreensNonPlaceholder = 0
@@ -305,7 +362,8 @@ public class ScreenFacadeImpl implements ScreenFacade {
             sections = sd.sectionByName.size()
             transitions = sd.transitionByName.size()
             for (TransitionItem ti in sd.transitionByName.values()) if (ti.hasActionsOrSingleService()) transitionsWithActions++
-            isNonPlaceholder = forms || sections || transitions
+            isNonPlaceholder = forms > 0 || sections > 0 || transitions > 3
+            // if (isNonPlaceholder) logger.info("Screen ${name} forms ${forms} sections ${sections} transitions ${transitions}")
 
             // trickle up totals
             ScreenInfo curParent = parentInfo
@@ -327,7 +385,8 @@ public class ScreenFacadeImpl implements ScreenFacade {
                 SubscreensItem curSsi = ssEntry.getValue()
                 List<String> childPath = new ArrayList(screenPath)
                 childPath.add(curSsi.getName())
-                ScreenInfo existingSi = (ScreenInfo) screenInfoCache.get(screenPathToString(childPath))
+                List<ScreenInfo> curInfoList = (List<ScreenInfo>) screenInfoCache.get(screenPathToString(childPath))
+                ScreenInfo existingSi = curInfoList ? (ScreenInfo) curInfoList.get(0) : null
                 if (existingSi != null) {
                     subscreenInfoByName.put(ssEntry.getKey(), existingSi)
                 } else {
@@ -351,10 +410,13 @@ public class ScreenFacadeImpl implements ScreenFacade {
             }
 
             // now that subscreen is initialized save in list for location and path
-            List curInfoList = (List) screenInfoCache.get(sd.location)
-            if (curInfoList == null) { curInfoList = []; screenInfoCache.put(sd.location, curInfoList) }
+            List<ScreenInfo> curInfoList = (List<ScreenInfo>) screenInfoCache.get(sd.location)
+            if (curInfoList == null) {
+                curInfoList = new LinkedList<>()
+                screenInfoCache.put(sd.location, curInfoList)
+            }
             curInfoList.add(this)
-            screenInfoCache.put(screenPathToString(screenPath), this)
+            screenInfoCache.put(screenPathToString(screenPath), [this])
         }
 
         String getIndentedName() {
@@ -388,8 +450,8 @@ public class ScreenFacadeImpl implements ScreenFacade {
                 if (ri.urlType && ri.urlType != "transition" && ri.urlType != "screen") continue
                 String expandedUrl = ri.url
                 if (expandedUrl.contains('${')) expandedUrl = ecfi.getResource().expand(expandedUrl, "")
-                ScreenUrlInfo sui = ScreenUrlInfo.getScreenUrlInfo(ecfi.getScreenFacade(), si.rootInfo.sd,
-                        si.sd, si.screenPath, expandedUrl, null)
+                ScreenUrlInfo sui = ScreenUrlInfo.getScreenUrlInfo(ecfi.screenFacade, si.rootInfo.sd,
+                        si.sd, si.screenPath, expandedUrl, 0)
                 if (sui.targetScreen == null) continue
                 String targetScreenPath = screenPathToString(sui.getPreTransitionPathNameList())
                 responseScreenPathSet.add(targetScreenPath)

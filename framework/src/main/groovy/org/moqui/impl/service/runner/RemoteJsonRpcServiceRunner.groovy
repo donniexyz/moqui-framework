@@ -15,9 +15,9 @@ package org.moqui.impl.service.runner
 
 import groovy.json.JsonBuilder
 import groovy.json.JsonSlurper
-
+import groovy.transform.CompileStatic
 import org.moqui.context.ExecutionContext
-import org.moqui.impl.StupidWebUtilities
+import org.moqui.util.WebUtilities
 import org.moqui.impl.service.ServiceDefinition
 import org.moqui.impl.service.ServiceFacadeImpl
 import org.moqui.impl.service.ServiceRunner
@@ -25,6 +25,7 @@ import org.moqui.impl.service.ServiceRunner
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 
+@CompileStatic
 public class RemoteJsonRpcServiceRunner implements ServiceRunner {
     protected final static Logger logger = LoggerFactory.getLogger(RemoteJsonRpcServiceRunner.class)
 
@@ -37,12 +38,12 @@ public class RemoteJsonRpcServiceRunner implements ServiceRunner {
     public Map<String, Object> runService(ServiceDefinition sd, Map<String, Object> parameters) {
         ExecutionContext ec = sfi.ecfi.getExecutionContext()
 
-        String location = sd.serviceNode.attribute("location")
-        String method = sd.serviceNode.attribute("method")
+        String location = sd.location
+        String method = sd.method
         if (!location) throw new IllegalArgumentException("Cannot call remote service [${sd.serviceName}] because it has no location specified.")
         if (!method) throw new IllegalArgumentException("Cannot call remote service [${sd.serviceName}] because it has no method specified.")
 
-        return runJsonService(sd.getServiceName(), location, method, parameters, ec)
+        return runJsonService(sd.serviceNameNoHash, location, method, parameters, ec)
     }
 
     static Map<String, Object> runJsonService(String serviceName, String location, String method,
@@ -54,7 +55,7 @@ public class RemoteJsonRpcServiceRunner implements ServiceRunner {
 
         // logger.warn("======== JSON-RPC remote service request to location [${location}]: ${jsonRequest}")
 
-        String jsonResponse = StupidWebUtilities.simpleHttpStringRequest(location, jsonRequest, "application/json")
+        String jsonResponse = WebUtilities.simpleHttpStringRequest(location, jsonRequest, "application/json")
 
         // logger.info("JSON-RPC remote service [${sd.getServiceName()}] request: ${httpPost.getRequestLine()}, ${httpPost.getAllHeaders()}, ${httpPost.getEntity().contentLength} bytes")
         // logger.warn("======== JSON-RPC remote service request entity [length:${httpPost.getEntity().contentLength}]: ${EntityUtils.toString(httpPost.getEntity())}")
@@ -68,28 +69,28 @@ public class RemoteJsonRpcServiceRunner implements ServiceRunner {
             // logger.warn("========== JSON-RPC response: ${jsonResponse}")
             jsonObj = slurper.parseText(jsonResponse)
         } catch (Throwable t) {
-            String errMsg = "Error parsing JSON-RPC response for service [${serviceName ?: method}]: ${t.toString()}"
+            String errMsg = ec.resource.expand('Error parsing JSON-RPC response for service [${serviceName ?: method}]: ${t.toString()}','',[serviceName:serviceName, method:method, t:t])
             logger.error(errMsg, t)
             ec.message.addError(errMsg)
             return null
         }
 
         if (jsonObj instanceof Map) {
-            Map responseMap = jsonObj
+            Map responseMap = (Map) jsonObj
             if (responseMap.error) {
                 logger.error("JSON-RPC service [${serviceName ?: method}] returned an error: ${responseMap.error}")
-                ec.message.addError((String) responseMap.error?.message ?: "JSON-RPC error with no message, code [${responseMap.error?.code}]")
+                ec.message.addError((String) ((Map) responseMap.error)?.message ?: ec.resource.expand('JSON-RPC error with no message, code [${responseMap.error?.code}]','',[responseMap:responseMap]))
                 return null
             } else {
                 Object jr = responseMap.result
                 if (jr instanceof Map) {
-                    return jr
+                    return (Map) jr
                 } else {
                     return [response:jr]
                 }
             }
         } else {
-            String errMsg = "JSON-RPC response was not a object/Map for service [${serviceName ?: method}]: ${jsonObj}"
+            String errMsg = ec.resource.expand('JSON-RPC response was not a object/Map for service [${serviceName ?: method}]: ${jsonObj}','',[serviceName:serviceName,method:method,jsonObj:jsonObj])
             logger.error(errMsg)
             ec.message.addError(errMsg)
             return null

@@ -14,24 +14,17 @@
 package org.moqui.impl.service
 
 import groovy.transform.CompileStatic
-import org.moqui.util.MNode
-
-import java.sql.Timestamp
-import javax.mail.Flags
-import javax.mail.internet.MimeMessage
-import javax.mail.Address
-import javax.mail.Multipart
-import javax.mail.BodyPart
-import javax.mail.Part
-import javax.mail.Header
-
 import org.apache.commons.io.IOUtils
 import org.moqui.impl.actions.XmlAction
 import org.moqui.impl.context.ExecutionContextFactoryImpl
-import org.moqui.context.ExecutionContext
-
+import org.moqui.impl.context.ExecutionContextImpl
+import org.moqui.util.MNode
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
+
+import javax.mail.*
+import javax.mail.internet.MimeMessage
+import java.sql.Timestamp
 
 @CompileStatic
 class EmailEcaRule {
@@ -60,7 +53,7 @@ class EmailEcaRule {
 
     // Node getEmecaNode() { return emecaNode }
 
-    void runIfMatches(MimeMessage message, String emailServerId, ExecutionContext ec) {
+    void runIfMatches(MimeMessage message, String emailServerId, ExecutionContextImpl ec) {
 
         try {
             ec.context.push()
@@ -76,11 +69,11 @@ class EmailEcaRule {
             fields.put("toList", toList)
 
             List<String> ccList = []
-            for (Address addr in message.getRecipients(MimeMessage.RecipientType.CC)) toList.add(addr.toString())
+            for (Address addr in message.getRecipients(MimeMessage.RecipientType.CC)) ccList.add(addr.toString())
             fields.put("ccList", ccList)
 
             List<String> bccList = []
-            for (Address addr in message.getRecipients(MimeMessage.RecipientType.BCC)) toList.add(addr.toString())
+            for (Address addr in message.getRecipients(MimeMessage.RecipientType.BCC)) bccList.add(addr.toString())
             fields.put("bccList", bccList)
 
             fields.put("from", message.getFrom() ? message.getFrom()[0] : null)
@@ -92,7 +85,9 @@ class EmailEcaRule {
 
             Map<String, Object> headers = [:]
             ec.context.put("headers", headers)
-            for (Header header in message.allHeaders) {
+            Enumeration<Header> allHeaders = message.getAllHeaders()
+            while (allHeaders.hasMoreElements()) {
+                Header header = allHeaders.nextElement()
                 String headerName = header.name.toLowerCase()
                 if (headers.get(headerName)) {
                     Object hi = headers.get(headerName)
@@ -124,7 +119,7 @@ class EmailEcaRule {
         }
     }
 
-    protected List<Map> makeBodyPartList(Part part) {
+    static List<Map> makeBodyPartList(Part part) {
         List<Map> bodyPartList = []
         Object content = part.getContent()
         Map bpMap = [contentType:part.getContentType(), filename:part.getFileName(), disposition:part.getDisposition()?.toLowerCase()]

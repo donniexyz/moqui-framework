@@ -14,51 +14,59 @@
 package org.moqui.impl.entity.condition;
 
 import org.moqui.entity.EntityCondition;
-import org.moqui.impl.entity.EntityJavaUtil;
-import org.moqui.impl.entity.EntityQueryBuilder.EntityConditionParameter;
-import org.moqui.impl.entity.EntityConditionFactoryImpl;
-import org.moqui.impl.entity.EntityQueryBuilder;
+import org.moqui.entity.EntityException;
+import org.moqui.impl.entity.*;
+import org.moqui.impl.entity.EntityJavaUtil.EntityConditionParameter;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.Externalizable;
+import java.io.IOException;
+import java.io.ObjectInput;
+import java.io.ObjectOutput;
 import java.util.*;
 
-public class FieldValueCondition extends EntityConditionImplBase {
+public class FieldValueCondition implements EntityConditionImplBase, Externalizable {
     protected final static Logger logger = LoggerFactory.getLogger(FieldValueCondition.class);
+    private static final Class thisClass = FieldValueCondition.class;
 
-    protected final ConditionField field;
-    protected final EntityCondition.ComparisonOperator operator;
+    protected ConditionField field;
+    protected ComparisonOperator operator;
     protected Object value;
     protected boolean ignoreCase = false;
-    protected Integer curHashCode = (Integer) null;
-    protected static final Class thisClass = FieldValueCondition.class;
+    private int curHashCode;
 
-    public FieldValueCondition(EntityConditionFactoryImpl ecFactoryImpl,
-            ConditionField field, EntityCondition.ComparisonOperator operator, Object value) {
-        super(ecFactoryImpl);
+    public FieldValueCondition() { }
+    public FieldValueCondition(ConditionField field, ComparisonOperator operator, Object value) {
         this.field = field;
         this.value = value;
 
         // default to EQUALS
-        EntityCondition.ComparisonOperator tempOp = operator != null ? operator : EQUALS;
+        ComparisonOperator tempOp = operator != null ? operator : EQUALS;
         // if EQUALS and we have a Collection value the IN operator is implied, similar with NOT_EQUAL
         if (value instanceof Collection) {
             if (tempOp == EQUALS) tempOp = IN;
             else if (tempOp == NOT_EQUAL) tempOp = NOT_IN;
         }
         this.operator = tempOp;
+
+        curHashCode = createHashCode();
     }
 
-    public EntityCondition.ComparisonOperator getOperator() { return operator; }
+    public ComparisonOperator getOperator() { return operator; }
     public String getFieldName() { return field.fieldName; }
     public Object getValue() { return value; }
     public boolean getIgnoreCase() { return ignoreCase; }
 
     @Override
     public void makeSqlWhere(EntityQueryBuilder eqb) {
-        StringBuilder sql = eqb.getSqlTopLevel();
+        @SuppressWarnings("MismatchedQueryAndUpdateOfStringBuilder")
+        StringBuilder sql = eqb.sqlTopLevel;
         boolean valueDone = false;
+        EntityDefinition mainEd = eqb.getMainEd();
+        FieldInfo fi = field.getFieldInfo(mainEd);
+        if (fi == null) throw new EntityException("Could not find field " + field.fieldName + " in entity " + eqb.getMainEd().getFullEntityName());
 
         if (value instanceof Collection && ((Collection) value).isEmpty()) {
             if (operator == IN) {
@@ -69,15 +77,9 @@ public class FieldValueCondition extends EntityConditionImplBase {
                 valueDone = true;
             }
         } else {
-            int typeValue = -1;
-            if (ignoreCase) {
-                EntityJavaUtil.FieldInfo fi = field.getFieldInfo(eqb.getMainEd());
-                typeValue = fi != null? fi.typeValue : 1;
-                if (typeValue == 1) sql.append("UPPER(");
-            }
-
-            sql.append(field.getColumnName(eqb.getMainEd()));
-            if (ignoreCase && typeValue == 1) sql.append(')');
+            if (ignoreCase && fi.typeValue == 1) sql.append("UPPER(");
+            sql.append(field.getColumnName(mainEd));
+            if (ignoreCase && fi.typeValue == 1) sql.append(')');
             sql.append(' ');
 
             if (value == null) {
@@ -108,13 +110,13 @@ public class FieldValueCondition extends EntityConditionImplBase {
                         if (isFirst) isFirst = false; else sql.append(", ");
                         sql.append("?");
                         if (ignoreCase && (curValue instanceof CharSequence)) curValue = curValue.toString().toUpperCase();
-                        eqb.getParameters().add(new EntityConditionParameter(field.getFieldInfo(eqb.getMainEntityDefinition()), curValue, eqb));
+                        eqb.parameters.add(new EntityConditionParameter(fi, curValue, eqb));
                     }
                     sql.append(')');
                 } else {
                     if (ignoreCase && (value instanceof CharSequence)) value = value.toString().toUpperCase();
                     sql.append(" (?)");
-                    eqb.getParameters().add(new EntityConditionParameter(field.getFieldInfo(eqb.getMainEntityDefinition()), value, eqb));
+                    eqb.parameters.add(new EntityConditionParameter(fi, value, eqb));
                 }
             } else if ((operator == BETWEEN || operator == NOT_BETWEEN) && value instanceof Collection &&
                     ((Collection) value).size() == 2) {
@@ -124,50 +126,53 @@ public class FieldValueCondition extends EntityConditionImplBase {
                 if (ignoreCase && (value1 instanceof CharSequence)) value1 = value1.toString().toUpperCase();
                 Object value2 = iterator.next();
                 if (ignoreCase && (value2 instanceof CharSequence)) value2 = value2.toString().toUpperCase();
-                eqb.getParameters().add(new EntityConditionParameter(field.getFieldInfo(eqb.getMainEntityDefinition()), value1, eqb));
-                eqb.getParameters().add(new EntityConditionParameter(field.getFieldInfo(eqb.getMainEntityDefinition()), value2, eqb));
+                eqb.parameters.add(new EntityConditionParameter(fi, value1, eqb));
+                eqb.parameters.add(new EntityConditionParameter(fi, value2, eqb));
             } else {
                 if (ignoreCase && (value instanceof CharSequence)) value = value.toString().toUpperCase();
                 sql.append(" ?");
-                eqb.getParameters().add(new EntityConditionParameter(field.getFieldInfo(eqb.getMainEntityDefinition()), value, eqb));
+                eqb.parameters.add(new EntityConditionParameter(fi, value, eqb));
             }
         }
     }
 
     @Override
-    public boolean mapMatches(Map<String, Object> map) { return EntityConditionFactoryImpl.compareByOperator(map.get(field.fieldName), operator, value); }
+    public boolean mapMatches(Map<String, Object> map) {
+        return EntityConditionFactoryImpl.compareByOperator(map.get(field.fieldName), operator, value);
+    }
+    @Override
+    public boolean mapMatchesAny(Map<String, Object> map) { return mapMatches(map); }
+    @Override
+    public boolean mapKeysNotContained(Map<String, Object> map) { return !map.containsKey(field.fieldName); }
 
     @Override
     public boolean populateMap(Map<String, Object> map) {
-        if (operator != EQUALS || ignoreCase || (field.entityAlias != null && field.entityAlias.length() > 0)) return false;
+        if (operator != EQUALS || ignoreCase || field instanceof ConditionAlias) return false;
         map.put(field.fieldName, value);
         return true;
     }
 
     public void getAllAliases(Set<String> entityAliasSet, Set<String> fieldAliasSet) {
         // this will only be called for view-entity, so we'll either have a entityAlias or an aliased fieldName
-        if (field.entityAlias != null && field.entityAlias.length() > 0) {
-            entityAliasSet.add(field.entityAlias);
+        if (field instanceof ConditionAlias) {
+            entityAliasSet.add(((ConditionAlias) field).entityAlias);
         } else {
             fieldAliasSet.add(field.fieldName);
         }
     }
 
     @Override
-    public EntityCondition ignoreCase() { this.ignoreCase = true; curHashCode = null; return this; }
+    public EntityCondition ignoreCase() { this.ignoreCase = true; curHashCode++; return this; }
 
     @Override
     public String toString() {
         return field.toString() + " " + EntityConditionFactoryImpl.getComparisonOperatorString(this.operator) + " " +
-                (value != null ? value.toString(): "null");
+                (value != null ? value.toString() + " (" + value.getClass().getName() + ")" : "null");
     }
 
     @Override
-    public int hashCode() {
-        if (curHashCode == null) curHashCode = createHashCode();
-        return curHashCode;
-    }
-    protected int createHashCode() {
+    public int hashCode() { return curHashCode; }
+    private int createHashCode() {
         return (field != null ? field.hashCode() : 0) + operator.hashCode() + (value != null ? value.hashCode() : 0) + (ignoreCase ? 1 : 0);
     }
 
@@ -175,15 +180,30 @@ public class FieldValueCondition extends EntityConditionImplBase {
     public boolean equals(Object o) {
         if (o == null || o.getClass() != thisClass) return false;
         FieldValueCondition that = (FieldValueCondition) o;
-        if (!field.equalsConditionField(that.field)) return false;
-        if (value == null && that.value != null) return false;
+        if (!field.equals(that.field)) return false;
         if (value != null) {
-            if (that.value == null) {
-                return false;
-            } else {
-                if (!value.equals(that.value)) return false;
-            }
+            if (!value.equals(that.value)) return false;
+        } else {
+            if (that.value != null) return false;
         }
         return operator == that.operator && ignoreCase == that.ignoreCase;
+    }
+
+    @Override
+    public void writeExternal(ObjectOutput out) throws IOException {
+        field.writeExternal(out);
+        // NOTE: found that the serializer in Hazelcast is REALLY slow with writeUTF(), uses String.chatAt() in a for loop, crazy
+        out.writeObject(operator.name().toCharArray());
+        out.writeObject(value);
+        out.writeBoolean(ignoreCase);
+    }
+    @Override
+    public void readExternal(ObjectInput in) throws IOException, ClassNotFoundException {
+        field = new ConditionField();
+        field.readExternal(in);
+        operator = ComparisonOperator.valueOf(new String((char[]) in.readObject()));
+        value = in.readObject();
+        ignoreCase = in.readBoolean();
+        curHashCode = createHashCode();
     }
 }

@@ -14,11 +14,11 @@
 package org.moqui.impl.entity
 
 import groovy.transform.CompileStatic
-import org.moqui.context.ExecutionContext
 import org.moqui.impl.actions.XmlAction
 import org.moqui.impl.context.ExecutionContextFactoryImpl
 import org.moqui.entity.EntityFind
 import org.moqui.entity.EntityValue
+import org.moqui.impl.context.ExecutionContextImpl
 import org.moqui.util.MNode
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
@@ -46,14 +46,14 @@ class EntityEcaRule {
         }
         // prep actions
         if (eecaNode.hasChild("actions")) {
-            actions = new XmlAction(ecfi, eecaNode.first("actions"), location + ".actions")
+            actions = new XmlAction(ecfi, eecaNode.first("actions"), null) // was location + ".actions" but not unique!
         }
     }
 
     String getEntityName() { return eecaNode.attribute("entity") }
     MNode getEecaNode() { return eecaNode }
 
-    void runIfMatches(String entityName, Map fieldValues, String operation, boolean before, ExecutionContext ec) {
+    void runIfMatches(String entityName, Map fieldValues, String operation, boolean before, ExecutionContextImpl ec) {
         // see if we match this event and should run
 
         // check this first since it is the most common disqualifier
@@ -108,11 +108,11 @@ class EntityEcaRule {
         }
 
         try {
-            ec.context.push()
-            ec.context.putAll(fieldValues)
-            ec.context.put("entityValue", fieldValues)
-            ec.context.put("originalValue", originalValue)
-            ec.context.put("eecaOperation", operation)
+            ec.contextStack.push()
+            ec.contextStack.putAll(fieldValues)
+            ec.contextStack.put("entityValue", fieldValues)
+            ec.contextStack.put("originalValue", originalValue)
+            ec.contextStack.put("eecaOperation", operation)
 
             // run the condition and if passes run the actions
             boolean conditionPassed = true
@@ -121,12 +121,12 @@ class EntityEcaRule {
                 if (actions) actions.run(ec)
             }
         } finally {
-            ec.context.pop()
+            ec.contextStack.pop()
         }
     }
 
     EntityValue getDbValue(Map fieldValues) {
-        EntityDefinition ed = ecfi.getEntityFacade().getEntityDefinition(entityName)
+        EntityDefinition ed = ecfi.entityFacade.getEntityDefinition(entityName)
         EntityFind ef = ecfi.entity.find(entityName)
         for (String pkFieldName in ed.getPkFieldNames()) ef.condition(pkFieldName, fieldValues.get(pkFieldName))
         return ef.one()

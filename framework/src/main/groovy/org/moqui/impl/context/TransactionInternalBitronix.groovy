@@ -22,6 +22,8 @@ import org.moqui.context.TransactionInternal
 import org.moqui.entity.EntityFacade
 import org.moqui.impl.entity.EntityFacadeImpl
 import org.moqui.util.MNode
+import org.slf4j.Logger
+import org.slf4j.LoggerFactory
 
 import javax.sql.DataSource
 import javax.transaction.TransactionManager
@@ -30,6 +32,7 @@ import java.sql.Connection
 
 @CompileStatic
 class TransactionInternalBitronix implements TransactionInternal {
+    protected final static Logger logger = LoggerFactory.getLogger(TransactionInternalBitronix.class)
 
     protected ExecutionContextFactoryImpl ecfi
 
@@ -58,12 +61,8 @@ class TransactionInternalBitronix implements TransactionInternal {
     @Override
     UserTransaction getUserTransaction() { return ut }
 
-    Properties getXaProperties() {
-
-    }
-
     @Override
-    DataSource getDataSource(EntityFacade ef, MNode datasourceNode, String tenantId) {
+    DataSource getDataSource(EntityFacade ef, MNode datasourceNode) {
         // NOTE: this is called during EFI init, so use the passed one and don't try to get from ECFI
         EntityFacadeImpl efi = (EntityFacadeImpl) ef
 
@@ -96,8 +95,8 @@ class TransactionInternalBitronix implements TransactionInternal {
         }
 
         // no need for this, just sets min and max sizes: ads.setPoolSize
-        if (dsi.inlineJdbc.attribute("pool-minsize")) pds.setMinPoolSize(dsi.inlineJdbc.attribute("pool-minsize") as int)
-        if (dsi.inlineJdbc.attribute("pool-maxsize")) pds.setMaxPoolSize(dsi.inlineJdbc.attribute("pool-maxsize") as int)
+        pds.setMinPoolSize((dsi.inlineJdbc.attribute("pool-minsize") ?: "5") as int)
+        pds.setMaxPoolSize((dsi.inlineJdbc.attribute("pool-maxsize") ?: "50") as int)
 
         if (dsi.inlineJdbc.attribute("pool-time-idle")) pds.setMaxIdleTime(dsi.inlineJdbc.attribute("pool-time-idle") as int)
         // if (dsi.inlineJdbc."@pool-time-reap") ads.setReapTimeout(dsi.inlineJdbc."@pool-time-reap" as int)
@@ -110,6 +109,7 @@ class TransactionInternalBitronix implements TransactionInternal {
         // pds.setShareTransactionConnections(false) // don't share connections in the ACCESSIBLE, needed?
         // pds.setIgnoreRecoveryFailures(false) // something to consider for XA recovery errors, quarantines by default
 
+        pds.setEnableJdbc4ConnectionTest(true) // use faster jdbc4 connection test
         // default is 0, disabled PreparedStatement cache (cache size per Connection)
         // NOTE: make this configurable? value too high or low?
         pds.setPreparedStatementCacheSize(100)
@@ -123,8 +123,11 @@ class TransactionInternalBitronix implements TransactionInternal {
             pds.setTestQuery(dsi.database.attribute("default-test-query"))
         }
 
+        logger.info("Initializing DataSource ${dsi.uniqueName} (${dsi.database.attribute('name')}) with properties: ${dsi.dsDetails}")
+
         // init the DataSource
         pds.init()
+        logger.info("Init DataSource ${dsi.uniqueName} (${dsi.database.attribute('name')}) isolation ${pds.getIsolationLevel()} (${isolationInt}), max pool ${pds.getMaxPoolSize()}")
 
         pdsList.add(pds)
 
@@ -133,6 +136,7 @@ class TransactionInternalBitronix implements TransactionInternal {
 
     @Override
     void destroy() {
+        logger.info("Shutting down Bitronix")
         // close the DataSources
         for (PoolingDataSource pds in pdsList) pds.close()
         // shutdown Bitronix

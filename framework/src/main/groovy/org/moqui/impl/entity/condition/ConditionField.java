@@ -15,81 +15,65 @@ package org.moqui.impl.entity.condition;
 
 import org.moqui.BaseException;
 import org.moqui.impl.entity.EntityDefinition;
-import org.moqui.impl.StupidJavaUtilities;
-import org.moqui.impl.entity.EntityJavaUtil;
+import org.moqui.impl.entity.FieldInfo;
 
-public class ConditionField {
-    String entityAlias = (String) null;
+import java.io.*;
+
+public class ConditionField implements Externalizable {
+    private static final Class thisClass = ConditionField.class;
     String fieldName;
-    EntityDefinition aliasEntityDef = (EntityDefinition) null;
-    String aliasEntityName = (String) null;
-    protected int curHashCode;
+    private int curHashCode;
+    private FieldInfo fieldInfo = null;
 
+    public ConditionField() { }
     public ConditionField(String fieldName) {
         if (fieldName == null) throw new BaseException("Empty fieldName not allowed");
         this.fieldName = fieldName.intern();
+        curHashCode = this.fieldName.hashCode();
+    }
+    public ConditionField(FieldInfo fi) {
+        if (fi == null) throw new BaseException("FieldInfo required");
+        fieldInfo = fi;
+        // fi.name is interned in makeFieldInfo()
+        fieldName = fi.name;
         curHashCode = fieldName.hashCode();
     }
-    public ConditionField(String entityAlias, String fieldName, EntityDefinition aliasEntityDef) {
-        if (fieldName == null) throw new BaseException("Empty fieldName not allowed");
-        this.entityAlias = entityAlias != null ? entityAlias.intern() : null;
-        this.fieldName = fieldName.intern();
-        this.aliasEntityDef = aliasEntityDef;
-        if (aliasEntityDef != null) {
-            String entName = aliasEntityDef.getFullEntityName();
-            aliasEntityName = entName != null ? entName.intern() : null;
-        }
-        curHashCode = createHashCode();
-    }
 
-    public String getEntityAlias() { return entityAlias; }
     public String getFieldName() { return fieldName; }
-    public EntityDefinition getAliasEntityDef() { return aliasEntityDef; }
-    public String getAliasEntityName() { return aliasEntityName; }
-
     public String getColumnName(EntityDefinition ed) {
-        StringBuilder colName = new StringBuilder();
-        // NOTE: this could have issues with view-entities as member entities where they have functions/etc; we may
-        // have to pass the prefix in to have it added inside functions/etc
-        if (entityAlias != null) colName.append(entityAlias).append('.');
-        if (aliasEntityDef != null) {
-            colName.append(aliasEntityDef.getColumnName(fieldName, false));
-        } else {
-            colName.append(ed.getColumnName(fieldName, false));
-        }
-        return colName.toString();
+        if (fieldInfo != null) return fieldInfo.getFullColumnName();
+        return ed.getColumnName(fieldName);
     }
-
-    public EntityJavaUtil.FieldInfo getFieldInfo(EntityDefinition ed) {
-        if (aliasEntityDef != null) {
-            return aliasEntityDef.getFieldInfo(fieldName);
-        } else {
-            return ed.getFieldInfo(fieldName);
-        }
+    public FieldInfo getFieldInfo(EntityDefinition ed) {
+        if (fieldInfo != null) return fieldInfo;
+        return ed.getFieldInfo(fieldName);
     }
 
     @Override
-    public String toString() { return (entityAlias != null ? (entityAlias + ".") : "") + fieldName; }
+    public String toString() { return fieldName; }
 
     @Override
     public int hashCode() { return curHashCode; }
-    protected int createHashCode() {
-        return (entityAlias != null ? entityAlias.hashCode() : 0) + (fieldName != null ? fieldName.hashCode() : 0) +
-                (aliasEntityDef != null ? aliasEntityDef.hashCode() : 0);
-    }
 
     @Override
     public boolean equals(Object o) {
-        if (o == null || o.getClass() != this.getClass()) return false;
+        if (o == null) return false;
+        // because of reuse from EntityDefinition this may be the same object, so check that first
+        if (this == o) return true;
+        if (o.getClass() != thisClass) return false;
         ConditionField that = (ConditionField) o;
-        return equalsConditionField(that);
+        // intern'ed String to use == operator
+        return fieldName == that.fieldName;
     }
-    public boolean equalsConditionField(ConditionField that) {
-        if (that == null) return false;
-        // both Strings are intern'ed so use != operator for object compare
-        if (fieldName != that.fieldName) return false;
-        if (!StupidJavaUtilities.internedStringsEqual(this.entityAlias, that.entityAlias)) return false;
-        if (!StupidJavaUtilities.internedStringsEqual(this.aliasEntityName, that.aliasEntityName)) return false;
-        return true;
+
+    @Override
+    public void writeExternal(ObjectOutput out) throws IOException {
+        out.writeObject(fieldName.toCharArray());
+    }
+
+    @Override
+    public void readExternal(ObjectInput in) throws IOException, ClassNotFoundException {
+        fieldName = new String((char[]) in.readObject()).intern();
+        curHashCode = fieldName.hashCode();
     }
 }

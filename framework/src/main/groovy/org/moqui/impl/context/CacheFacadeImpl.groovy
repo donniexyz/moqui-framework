@@ -14,56 +14,172 @@
 package org.moqui.impl.context
 
 import groovy.transform.CompileStatic
+import org.moqui.jcache.MCache
+import org.moqui.jcache.MCacheConfiguration
+import org.moqui.jcache.MCacheManager
+import org.moqui.impl.tools.MCacheToolFactory
+import org.moqui.jcache.MEntry
+import org.moqui.jcache.MStats
+import org.moqui.util.CollectionUtilities
 import org.moqui.util.MNode
+import org.moqui.util.ObjectUtilities
 
+import javax.cache.Cache
+import javax.cache.CacheManager
+import javax.cache.configuration.Configuration
+import javax.cache.configuration.Factory
+import javax.cache.configuration.MutableConfiguration
+import javax.cache.expiry.AccessedExpiryPolicy
+import javax.cache.expiry.CreatedExpiryPolicy
+import javax.cache.expiry.Duration
+import javax.cache.expiry.EternalExpiryPolicy
+import javax.cache.expiry.ExpiryPolicy
+import java.sql.Timestamp
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentMap
 
-import static org.moqui.context.Cache.EvictionStrategy.*
-
 import org.moqui.context.CacheFacade
-import org.moqui.context.Cache
-import org.moqui.context.Cache.EvictionStrategy
-import org.moqui.impl.StupidUtilities
-
-import net.sf.ehcache.CacheManager
-import net.sf.ehcache.Ehcache
-import net.sf.ehcache.config.CacheConfiguration
-import net.sf.ehcache.store.MemoryStoreEvictionPolicy
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
+
+import java.util.concurrent.TimeUnit
 
 @CompileStatic
 public class CacheFacadeImpl implements CacheFacade {
     protected final static Logger logger = LoggerFactory.getLogger(CacheFacadeImpl.class)
 
     protected final ExecutionContextFactoryImpl ecfi
-    
-    /** This is the Ehcache CacheManager singleton for use in Moqui.
-     * Gets config from the default location, ie the ehcache.xml file from the classpath.
-     */
-    protected final CacheManager cacheManager
 
-    protected final ConcurrentMap<String, CacheImpl> localCacheImplMap = new ConcurrentHashMap<String, CacheImpl>()
+    protected CacheManager localCacheManagerInternal = (CacheManager) null
+    protected CacheManager distCacheManagerInternal = (CacheManager) null
+
+    final ConcurrentMap<String, Cache> localCacheMap = new ConcurrentHashMap<>()
 
     CacheFacadeImpl(ExecutionContextFactoryImpl ecfi) {
         this.ecfi = ecfi
-        cacheManager = CacheManager.create()
+
+        MNode cacheListNode = ecfi.getConfXmlRoot().first("cache-list")
+        String localCacheFactoryName = cacheListNode.attribute("local-factory") ?: MCacheToolFactory.TOOL_NAME
+        localCacheManagerInternal = ecfi.getTool(localCacheFactoryName, CacheManager.class)
     }
 
-    void destroy() { cacheManager.shutdown() }
+    CacheManager getDistCacheManager() {
+        if (distCacheManagerInternal == null) {
+            MNode cacheListNode = ecfi.getConfXmlRoot().first("cache-list")
+            String distCacheFactoryName = cacheListNode.attribute("distributed-factory") ?: MCacheToolFactory.TOOL_NAME
+            distCacheManagerInternal = ecfi.getTool(distCacheFactoryName, CacheManager.class)
+        }
+        return distCacheManagerInternal
+    }
 
-    protected String getFullName(String cacheName, String tenantId) {
-        if (cacheName == null) return null
-        if (cacheName.contains("__")) return cacheName
-        MNode cacheElement = getCacheNode(cacheName)
-        if (cacheElement?.attribute("tenants-share") == "true") {
-            return cacheName
-        } else {
-            if (!tenantId) tenantId = ecfi.getEci().getTenantId()
-            return tenantId.concat("__").concat(cacheName)
+    void destroy() {
+        if (localCacheManagerInternal != null) {
+            for (String cacheName in localCacheManagerInternal.getCacheNames())
+                localCacheManagerInternal.destroyCache(cacheName)
+        }
+        localCacheMap.clear()
+        if (distCacheManagerInternal != null) {
+            for (String cacheName in distCacheManagerInternal.getCacheNames())
+                distCacheManagerInternal.destroyCache(cacheName)
         }
     }
+
+    @Override
+    void clearAllCaches() { for (Cache cache in localCacheMap.values()) cache.clear() }
+
+    @Override
+    void clearCachesByPrefix(String prefix) {
+        for (Map.Entry<String, Cache> entry in localCacheMap.entrySet()) {
+            String tempName = entry.key
+            int separatorIndex = tempName.indexOf("__")
+            if (separatorIndex > 0) tempName = tempName.substring(separatorIndex + 2)
+            if (!tempName.startsWith(prefix)) continue
+
+            entry.value.clear()
+        }
+    }
+
+    @Override
+    Cache getCache(String cacheName) { return getCacheInternal(cacheName, "local") }
+    @Override
+    <K, V> Cache<K, V> getCache(String cacheName, Class<K> keyType, Class<V> valueType) {
+        return getCacheInternal(cacheName, "local")
+    }
+
+    @Override
+    MCache getLocalCache(String cacheName) {
+        return getCacheInternal(cacheName, "local").unwrap(MCache.class)
+    }
+    @Override
+    Cache getDistributedCache(String cacheName) {
+        return getCacheInternal(cacheName, "distributed")
+    }
+
+    Cache getCacheInternal(String cacheName, String defaultCacheType) {
+        Cache theCache = localCacheMap.get(cacheName)
+        if (theCache == null) {
+            localCacheMap.putIfAbsent(cacheName, initCache(cacheName, defaultCacheType))
+            theCache = localCacheMap.get(cacheName)
+        }
+        return theCache
+    }
+
+    @Override
+    void registerCache(Cache cache) {
+        String cacheName = cache.getName()
+        localCacheMap.putIfAbsent(cacheName, cache)
+    }
+
+    @Override
+    boolean cacheExists(String cacheName) { return localCacheMap.containsKey(cacheName) }
+    @Override
+    Set<String> getCacheNames() { return localCacheMap.keySet() }
+
+    List<Map<String, Object>> getAllCachesInfo(String orderByField, String filterRegexp) {
+        boolean hasFilterRegexp = filterRegexp != null && filterRegexp.length() > 0
+        List<Map<String, Object>> ci = new LinkedList()
+        for (String cn in localCacheMap.keySet()) {
+            if (hasFilterRegexp && !cn.matches("(?i).*" + filterRegexp + ".*")) continue
+            Cache co = getCache(cn)
+            /* TODO: somehow support external cache stats like Hazelcast, through some sort of Moqui interface or maybe the JMX bean?
+               NOTE: this isn't all that important because we don't have a good use case for distributed caches
+            if (co instanceof ICache) {
+                ICache ico = co.unwrap(ICache.class)
+                CacheStatistics cs = ico.getLocalCacheStatistics()
+                CacheConfig conf = co.getConfiguration(CacheConfig.class)
+                EvictionConfig evConf = conf.getEvictionConfig()
+                ExpiryPolicy expPol = conf.getExpiryPolicyFactory()?.create()
+                Long expireIdle = expPol.expiryForAccess?.durationAmount ?: 0
+                Long expireLive = expPol.expiryForCreation?.durationAmount ?: 0
+                ci.add([name:co.getName(), expireTimeIdle:expireIdle,
+                        expireTimeLive:expireLive, maxElements:evConf.getSize(),
+                        evictionStrategy:evConf.getEvictionPolicy().name(), size:ico.size(),
+                        getCount:cs.getCacheGets(), putCount:cs.getCachePuts(),
+                        hitCount:cs.getCacheHits(), missCountTotal:cs.getCacheMisses(),
+                        evictionCount:cs.getCacheEvictions(), removeCount:cs.getCacheRemovals(),
+                        expireCount:0] as Map<String, Object>)
+            } else
+            */
+            if (co instanceof MCache) {
+                MCache mc = co.unwrap(MCache.class)
+                MStats stats = mc.getMStats()
+                Long expireIdle = mc.getAccessDuration()?.durationAmount ?: 0
+                Long expireLive = mc.getCreationDuration()?.durationAmount ?: 0
+                ci.add([name:co.getName(), expireTimeIdle:expireIdle,
+                        expireTimeLive:expireLive, maxElements:mc.getMaxEntries(),
+                        evictionStrategy:"LRU", size:mc.size(),
+                        getCount:stats.getCacheGets(), putCount:stats.getCachePuts(),
+                        hitCount:stats.getCacheHits(), missCountTotal:stats.getCacheMisses(),
+                        evictionCount:stats.getCacheEvictions(), removeCount:stats.getCacheRemovals(),
+                        expireCount:stats.getCacheExpires()] as Map<String, Object>)
+            } else {
+                logger.warn("Cannot get detailed info for cache ${cn} which is of type ${co.class.name}")
+            }
+        }
+        if (orderByField) CollectionUtilities.orderMapList(ci, [orderByField])
+        return ci
+    }
+
     protected MNode getCacheNode(String cacheName) {
         MNode cacheListNode = ecfi.getConfXmlRoot().first("cache-list")
         MNode cacheElement = cacheListNode.first({ MNode it -> it.name == "cache" && it.attribute("name") == cacheName })
@@ -73,101 +189,131 @@ public class CacheFacadeImpl implements CacheFacade {
         return cacheElement
     }
 
-    @Override
-    void clearAllCaches() { cacheManager.clearAll() }
+    protected synchronized Cache initCache(String cacheName, String defaultCacheType) {
+        if (localCacheMap.containsKey(cacheName)) return localCacheMap.get(cacheName)
 
-    @Override
-    void clearExpiredFromAllCaches() {
-        List<String> cacheNames = Arrays.asList(cacheManager.getCacheNames())
-        for (String cacheName in cacheNames) {
-            Ehcache ehcache = cacheManager.getEhcache(cacheName)
-            ehcache.evictExpiredElements()
-        }
-    }
+        if (!defaultCacheType) defaultCacheType = "local"
 
-    @Override
-    void clearCachesByPrefix(String prefix) { cacheManager.clearAllStartingWith(getFullName(prefix, null)) }
+        Cache newCache
+        MNode cacheNode = getCacheNode(cacheName)
+        if (cacheNode != null) {
+            String keyTypeName = cacheNode.attribute("key-type") ?: "String"
+            String valueTypeName = cacheNode.attribute("value-type") ?: "Object"
+            Class keyType = ObjectUtilities.getClass(keyTypeName)
+            Class valueType = ObjectUtilities.getClass(valueTypeName)
 
-    @Override
-    Cache getCache(String cacheName) { return getCacheImpl(cacheName, null) }
-
-    CacheImpl getCacheImpl(String cacheName, String tenantId) {
-        String fullName = getFullName(cacheName, tenantId)
-        CacheImpl theCache = localCacheImplMap.get(fullName)
-        if (theCache == null) {
-            localCacheImplMap.putIfAbsent(fullName, new CacheImpl(initCache(cacheName, tenantId)))
-            theCache = localCacheImplMap.get(fullName)
-        }
-        return theCache
-    }
-
-    boolean cacheExists(String cacheName) { return cacheManager.cacheExists(getFullName(cacheName, null)) }
-    String[] getCacheNames() { return cacheManager.getCacheNames() }
-
-    List<Map<String, Object>> getAllCachesInfo(String orderByField) {
-        List<Map<String, Object>> ci = new LinkedList()
-        for (String cn in cacheManager.getCacheNames()) {
-            Cache co = getCache(cn)
-            ci.add([name:co.getName(), expireTimeIdle:co.getExpireTimeIdle(),
-                    expireTimeLive:co.getExpireTimeLive(), maxElements:co.getMaxElements(),
-                    evictionStrategy:getEvictionStrategyString(co.evictionStrategy), size:co.size(),
-                    hitCount:co.getHitCount(), missCountNotFound:co.getMissCountNotFound(),
-                    missCountExpired:co.getMissCountExpired(), missCountTotal:co.getMissCountTotal(),
-                    removeCount:co.getRemoveCount()] as Map<String, Object>)
-        }
-        if (orderByField) StupidUtilities.orderMapList(ci, [orderByField])
-        return ci
-    }
-
-    static String getEvictionStrategyString(EvictionStrategy es) {
-        switch (es) {
-            case LEAST_RECENTLY_USED: return "LRU"
-            case LEAST_RECENTLY_ADDED: return "LRA"
-            case LEAST_FREQUENTLY_USED: return "LFU"
-        }
-    }
-
-
-    protected synchronized net.sf.ehcache.Cache initCache(String cacheName, String tenantId) {
-        if (cacheName.contains("__")) cacheName = cacheName.substring(cacheName.indexOf("__") + 2)
-        String fullCacheName = getFullName(cacheName, tenantId)
-        if (cacheManager.cacheExists(fullCacheName)) return cacheManager.getCache(fullCacheName)
-
-        // make a cache with the default settings from ehcache.xml
-        cacheManager.addCacheIfAbsent(fullCacheName)
-        net.sf.ehcache.Cache newCache = cacheManager.getCache(fullCacheName)
-        // not supported in 2.7.2: newCache.setSampledStatisticsEnabled(true)
-
-        // set any applicable settings from the moqui conf xml file
-        CacheConfiguration newCacheConf = newCache.getCacheConfiguration()
-        MNode cacheElement = getCacheNode(cacheName)
-
-        boolean eternal = true
-        if (cacheElement?.attribute("expire-time-idle")) {
-            newCacheConf.setTimeToIdleSeconds(Long.valueOf(cacheElement.attribute("expire-time-idle")))
-            eternal = false
-        }
-        if (cacheElement?.attribute("expire-time-live")) {
-            newCacheConf.setTimeToLiveSeconds(Long.valueOf(cacheElement.attribute("expire-time-live")))
-            eternal = false
-        }
-        newCacheConf.setEternal(eternal)
-
-        if (cacheElement?.attribute("max-elements")) {
-            newCacheConf.setMaxEntriesLocalHeap(Integer.valueOf(cacheElement.attribute("max-elements")))
-        }
-        String evictionStrategy = cacheElement?.attribute("eviction-strategy")
-        if (evictionStrategy) {
-            if ("least-recently-used" == evictionStrategy) {
-                newCacheConf.setMemoryStoreEvictionPolicyFromObject(MemoryStoreEvictionPolicy.LRU)
-            } else if ("least-frequently-used" == evictionStrategy) {
-                newCacheConf.setMemoryStoreEvictionPolicyFromObject(MemoryStoreEvictionPolicy.LFU)
-            } else if ("least-recently-added" == evictionStrategy) {
-                newCacheConf.setMemoryStoreEvictionPolicyFromObject(MemoryStoreEvictionPolicy.FIFO)
+            Factory<ExpiryPolicy> expiryPolicyFactory
+            if (cacheNode.attribute("expire-time-idle") && cacheNode.attribute("expire-time-idle") != "0") {
+                expiryPolicyFactory = AccessedExpiryPolicy.factoryOf(
+                        new Duration(TimeUnit.SECONDS, Long.parseLong(cacheNode.attribute("expire-time-idle"))))
+            } else if (cacheNode.attribute("expire-time-live") && cacheNode.attribute("expire-time-live") != "0") {
+                expiryPolicyFactory = CreatedExpiryPolicy.factoryOf(
+                        new Duration(TimeUnit.SECONDS, Long.parseLong(cacheNode.attribute("expire-time-live"))))
+            } else {
+                expiryPolicyFactory = EternalExpiryPolicy.factoryOf()
             }
+
+            String cacheType = cacheNode.attribute("type") ?: defaultCacheType
+            CacheManager cacheManager
+            if ("local".equals(cacheType)) {
+                cacheManager = localCacheManagerInternal
+            } else if ("distributed".equals(cacheType)) {
+                cacheManager = getDistCacheManager()
+            } else {
+                throw new IllegalArgumentException("Cache type ${cacheType} not supported")
+            }
+
+            Configuration config
+            if (cacheManager instanceof MCacheManager) {
+                // use MCache
+                MCacheConfiguration mConf = new MCacheConfiguration()
+                mConf.setTypes(keyType, valueType)
+                mConf.setStoreByValue(false).setStatisticsEnabled(true)
+                mConf.setExpiryPolicyFactory(expiryPolicyFactory)
+
+                String maxElementsStr = cacheNode.attribute("max-elements")
+                if (maxElementsStr && maxElementsStr != "0") {
+                    int maxElements = Integer.parseInt(maxElementsStr)
+                    mConf.setMaxEntries(maxElements)
+                }
+
+                config = (Configuration) mConf
+            /* TODO: somehow support external cache configuration like Hazelcast, through some sort of Moqui interface, maybe pass cacheNode to Cache factory?
+               NOTE: this isn't all that important because we don't have a good use case for distributed caches, and they can be configured directly through hazelcast.xml or other Hazelcast conf
+            } else if (cacheManager instanceof AbstractHazelcastCacheManager) {
+                // use Hazelcast
+                CacheConfig cacheConfig = new CacheConfig()
+                cacheConfig.setTypes(keyType, valueType)
+                cacheConfig.setStoreByValue(true).setStatisticsEnabled(true)
+                cacheConfig.setExpiryPolicyFactory(expiryPolicyFactory)
+
+                // from here down the settings are specific to Hazelcast (not supported in javax.cache)
+                cacheConfig.setName(fullCacheName)
+                cacheConfig.setInMemoryFormat(InMemoryFormat.OBJECT)
+
+                String maxElementsStr = cacheNode.attribute("max-elements")
+                if (maxElementsStr && maxElementsStr != "0") {
+                    int maxElements = Integer.parseInt(maxElementsStr)
+                    EvictionPolicy ep = cacheNode.attribute("eviction-strategy") == "least-recently-used" ? EvictionPolicy.LRU : EvictionPolicy.LFU
+                    EvictionConfig evictionConfig = new EvictionConfig(maxElements, EvictionConfig.MaxSizePolicy.ENTRY_COUNT, ep)
+                    cacheConfig.setEvictionConfig(evictionConfig)
+                }
+
+                config = (Configuration) cacheConfig
+            */
+            } else {
+                logger.info("Initializing cache ${cacheName} which has a CacheManager of type ${cacheManager.class.name} and extended configuration not supported, using simple MutableConfigutation")
+                MutableConfiguration mutConfig = new MutableConfiguration()
+                mutConfig.setTypes(keyType, valueType)
+                mutConfig.setStoreByValue("distributed".equals(cacheType)).setStatisticsEnabled(true)
+                mutConfig.setExpiryPolicyFactory(expiryPolicyFactory)
+
+                config = (Configuration) mutConfig
+            }
+
+            newCache = cacheManager.createCache(cacheName, config)
+        } else {
+            CacheManager cacheManager
+            boolean storeByValue
+            if ("local".equals(defaultCacheType)) {
+                cacheManager = localCacheManagerInternal
+                storeByValue = false
+            } else if ("distributed".equals(defaultCacheType)) {
+                cacheManager = getDistCacheManager()
+                storeByValue = true
+            } else {
+                throw new IllegalArgumentException("Default cache type ${defaultCacheType} not supported")
+            }
+
+            logger.info("Creating default ${defaultCacheType} cache ${cacheName}, storeByValue=${storeByValue}")
+            MutableConfiguration mutConfig = new MutableConfiguration()
+            mutConfig.setStoreByValue(storeByValue).setStatisticsEnabled(true)
+            // any defaults we want here? better to use underlying defaults and conf file settings only
+            newCache = cacheManager.createCache(cacheName, mutConfig)
         }
 
-        if (logger.isTraceEnabled()) logger.trace("Initialized new cache [${fullCacheName}]")
+        // NOTE: put in localCacheMap done in caller (getCache)
         return newCache
+    }
+
+    List<Map> makeElementInfoList(String cacheName, String orderByField) {
+        Cache cache = getCache(cacheName)
+        if (cache instanceof MCache) {
+            MCache mCache = cache.unwrap(MCache.class)
+            List<Map> elementInfoList = new ArrayList<>();
+            for (Cache.Entry ce in mCache.getEntryList()) {
+                MEntry entry = ce.unwrap(MEntry.class)
+                Map<String, Object> im = new HashMap<String, Object>([key:entry.key as String,
+                        value:entry.value as String, hitCount:entry.getAccessCount(),
+                        creationTime:new Timestamp(entry.getCreatedTime())])
+                if (entry.getLastUpdatedTime()) im.lastUpdateTime = new Timestamp(entry.getLastUpdatedTime())
+                if (entry.getLastAccessTime()) im.lastAccessTime = new Timestamp(entry.getLastAccessTime())
+                elementInfoList.add(im)
+            }
+            if (orderByField) CollectionUtilities.orderMapList(elementInfoList, [orderByField])
+            return elementInfoList
+        } else {
+            return new ArrayList<Map>()
+        }
     }
 }

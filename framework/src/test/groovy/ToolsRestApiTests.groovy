@@ -32,7 +32,7 @@ class ToolsRestApiTests extends Specification {
 
     def setupSpec() {
         ec = Moqui.getExecutionContext()
-        ec.user.loginUser("john.doe", "moqui", null)
+        ec.user.loginUser("john.doe", "moqui")
         screenTest = ec.screen.makeTest().baseScreenPath("rest")
     }
 
@@ -67,12 +67,11 @@ class ToolsRestApiTests extends Specification {
 
         where:
         screenPath | containsText1 | containsText2
-        "s1/moqui/artifacts/hitSummary?artifactType=entity&artifactSubType=create&artifactName=moqui.basic&artifactName_op=contains" |
+        "s1/moqui/artifacts/hitSummary?artifactType=AT_ENTITY&artifactSubType=create&artifactName=moqui.basic&artifactName_op=contains" |
                 "moqui.basic.StatusType" | '"artifactSubType": "create"'
         "s1/moqui/basic/geos/USA" | "United States" | "Country"
         "s1/moqui/basic/geos/USA/regions" | "" | ""
         "s1/moqui/email/templates" | "PASSWORD_RESET" | "classpath://screen/PasswordReset.xml"
-        // depends on data in example component: "s1/moqui/entity/syncs/EXAMPLE" | "Example sync to EXAMPLE1 tenant" | "example\\\\..*"
         // TODO add more... current are enough to make sure Service REST API working generally, but more would be nice
     }
 }
